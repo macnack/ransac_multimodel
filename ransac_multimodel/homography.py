@@ -42,7 +42,14 @@ def srt_to_matrix(params):
     )
 
 
-def srt_residuals(params, pts_A, means_B, inv_covs_B):
+def srt_residuals(
+    params,
+    pts_A,
+    means_B,
+    inv_covs_B,
+    scale_reg_weight=0.01,
+    rot_reg_weight=0.001,
+):
     """
     Mahalanobis residuals for a similarity (sRT) homography parametrised as
     [s, theta, tx, ty].
@@ -55,7 +62,7 @@ def srt_residuals(params, pts_A, means_B, inv_covs_B):
 
     scale_loss = (params[0] - 1.0) ** 2
     rot_loss = np.degrees(params[1]) ** 2
-    regularization = scale_loss * 0.01 + rot_loss * 0.001
+    regularization = scale_loss * scale_reg_weight + rot_loss * rot_reg_weight
     return mahalanobis_loss + regularization
 
 
@@ -81,6 +88,19 @@ def optimize_homography(
     model="full",
     use_means_for_ransac=False,
     verbose=0,
+    quiet=False,
+    ransac_method=cv2.RANSAC,
+    ransac_reproj_threshold=3.0,
+    ransac_max_iters=5000,
+    ransac_confidence=0.995,
+    robust_loss="huber",
+    f_scale=2.0,
+    max_nfev=5000,
+    srt_x_scale=(0.20, 1.0, 1.0, 1.0),
+    srt_bounds=([0.25, np.radians(-180), -60, -60], [3.0, np.radians(180), 60, 60]),
+    srt_scale_reg_weight=0.01,
+    srt_rot_reg_weight=0.001,
+    return_details=False,
 ):
     """
     Optimizes the homography using the Mahalanobis distance and Huber Loss.
@@ -97,38 +117,49 @@ def optimize_homography(
     else:
         ransac_pts_B = peaks_B if peaks_B is not None else means_B
 
-    H_init, _ = cv2.findHomography(pts_A, ransac_pts_B, cv2.RANSAC, maxIters=5000)
+    H_init, inlier_mask = cv2.findHomography(
+        pts_A,
+        ransac_pts_B,
+        ransac_method,
+        ransacReprojThreshold=ransac_reproj_threshold,
+        maxIters=ransac_max_iters,
+        confidence=ransac_confidence,
+    )
     if H_init is None:
-        print("Warning: RANSAC failed to find an initial guess. Defaulting to Identity.")
+        if not quiet:
+            print("Warning: RANSAC failed to find an initial guess. Defaulting to Identity.")
         H_init = np.eye(3)
+        inlier_mask = np.zeros((N, 1), dtype=np.uint8)
 
     H_init_norm = H_init / H_init[2, 2]
     h_init_elements = H_init_norm.flatten()[:8]
 
     if model == "sRT":
         srt_init = extract_srt_from_homography(H_init_norm)
-        print(
-            f"  sRT init: s={srt_init[0]:.4f}, θ={np.degrees(srt_init[1]):.2f}°, "
-            f"tx={srt_init[2]:.2f}, ty={srt_init[3]:.2f}"
-        )
+        if not quiet:
+            print(
+                f"  sRT init: s={srt_init[0]:.4f}, θ={np.degrees(srt_init[1]):.2f}°, "
+                f"tx={srt_init[2]:.2f}, ty={srt_init[3]:.2f}"
+            )
 
         res = least_squares(
             fun=srt_residuals,
             x0=srt_init,
-            args=(pts_A, means_B, inv_covs_B),
+            args=(pts_A, means_B, inv_covs_B, srt_scale_reg_weight, srt_rot_reg_weight),
             method="trf",
-            loss="huber",
-            f_scale=2.0,
-            max_nfev=5000,
+            loss=robust_loss,
+            f_scale=f_scale,
+            max_nfev=max_nfev,
             verbose=verbose,
-            x_scale=[0.20, 1.0, 1.0, 1.0],
-            bounds=([0.25, np.radians(-180), -60, -60], [3.0, np.radians(180), 60, 60]),
+            x_scale=srt_x_scale,
+            bounds=srt_bounds,
         )
 
-        print(
-            f"  sRT optimized: s={res.x[0]:.4f}, θ={np.degrees(res.x[1]):.2f}°, "
-            f"tx={res.x[2]:.2f}, ty={res.x[3]:.2f}"
-        )
+        if not quiet:
+            print(
+                f"  sRT optimized: s={res.x[0]:.4f}, θ={np.degrees(res.x[1]):.2f}°, "
+                f"tx={res.x[2]:.2f}, ty={res.x[3]:.2f}"
+            )
         H_opt = srt_to_matrix(res.x)
     else:
         res = least_squares(
@@ -136,12 +167,25 @@ def optimize_homography(
             x0=h_init_elements,
             args=(pts_A, means_B, inv_covs_B),
             method="trf",
-            loss="huber",
-            f_scale=2.0,
-            max_nfev=5000,
+            loss=robust_loss,
+            f_scale=f_scale,
+            max_nfev=max_nfev,
             verbose=verbose,
         )
         H_opt = np.append(res.x, 1.0).reshape(3, 3)
+
+    if return_details:
+        details = {
+            "num_correspondences": int(N),
+            "num_inliers": int(np.sum(inlier_mask)) if inlier_mask is not None else 0,
+            "inlier_ratio": float(np.mean(inlier_mask)) if inlier_mask is not None else 0.0,
+            "optimization_success": bool(getattr(res, "success", True)),
+            "optimization_status": int(getattr(res, "status", 0)),
+            "optimization_message": str(getattr(res, "message", "")),
+            "optimization_cost": float(getattr(res, "cost", np.nan)),
+            "optimization_nfev": int(getattr(res, "nfev", 0)),
+        }
+        return H_opt, H_init, details
 
     return H_opt, H_init
 

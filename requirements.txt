@@ -3,3 +3,4 @@ scipy
 opencv-python
 matplotlib
 torch
+optuna

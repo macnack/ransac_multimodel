@@ -8,6 +8,14 @@ def find_gaussians(
     adaptive_gauss_fit: bool = True,
     plot_heatmaps: bool = False,
     plotter=None,
+    log_missing_gaussians: bool = True,
+    adaptive_threshold: float = 0.003,
+    adaptive_n_sigma: float = 3.0,
+    adaptive_max_iter: int = 10,
+    adaptive_min_half_w: int = 1,
+    adaptive_max_half_w: int = 5,
+    fixed_threshold: float = 0.008,
+    fixed_window_size: int = 4,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Fit Gaussians to every patch heatmap in *tensor* and return correspondences.
@@ -29,17 +37,17 @@ def find_gaussians(
             if adaptive_gauss_fit:
                 gaussians = extract_gaussians_adaptive(
                     heatmap,
-                    threshold=0.003,
-                    n_sigma=3.0,
-                    max_iter=10,
-                    min_half_w=1,
-                    max_half_w=5,
+                    threshold=adaptive_threshold,
+                    n_sigma=adaptive_n_sigma,
+                    max_iter=adaptive_max_iter,
+                    min_half_w=adaptive_min_half_w,
+                    max_half_w=adaptive_max_half_w,
                 )
             else:
                 gaussians = extract_gaussians_from_heatmap2(
                     heatmap,
-                    threshold=0.008,
-                    window_size=4,
+                    threshold=fixed_threshold,
+                    window_size=fixed_window_size,
                 )
 
             coord = (px, py)
@@ -55,7 +63,8 @@ def find_gaussians(
 
     for (px, py), gaussians in dict_of_gaussians.items():
         if not gaussians:
-            print(f"No Gaussians found in patch ({px}, {py})")
+            if log_missing_gaussians:
+                print(f"No Gaussians found in patch ({px}, {py})")
             continue
 
         for g in gaussians:
