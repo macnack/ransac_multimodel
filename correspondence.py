@@ -9,6 +9,7 @@ def find_gaussians(
     plot_heatmaps: bool = False,
     plotter=None,
     log_missing_gaussians: bool = True,
+    missing_gaussians_logger=None,
     adaptive_threshold: float = 0.003,
     adaptive_n_sigma: float = 3.0,
     adaptive_max_iter: int = 10,
@@ -65,6 +66,8 @@ def find_gaussians(
         if not gaussians:
             if log_missing_gaussians:
                 print(f"No Gaussians found in patch ({px}, {py})")
+            if missing_gaussians_logger is not None:
+                missing_gaussians_logger(px, py)
             continue
 
         for g in gaussians:

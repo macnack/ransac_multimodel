@@ -40,7 +40,7 @@ def plot_heatmap_comparison(heatmap, gaussians, px, py):
     plt.show()
 
 
-def plot_homography_projection(pts_A, means_B, H, size_a=14, size_b=56, title_suffix=""):
+def plot_homography_projection(pts_A, means_B, H, size_a=14, size_b=56, title_suffix="", save_path=None):
     """
     Plot image A alongside its projection into image B space via homography H.
     """
@@ -96,9 +96,13 @@ def plot_homography_projection(pts_A, means_B, H, size_a=14, size_b=56, title_su
         ax_b.legend(fontsize=8)
 
     plt.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+    return fig
 
 
-def plot_correspondences_with_arrows(pts_A, means_B, peaks_B, covs_B, size_a, size_b):
+def plot_correspondences_with_arrows(pts_A, means_B, peaks_B, covs_B, size_a, size_b, save_path=None):
     """
     Visualize pts_A on the left, means_B, peaks_B, covs_B on the right,
     with arrows connecting correspondences from the left image to the right image.
@@ -166,6 +170,10 @@ def plot_correspondences_with_arrows(pts_A, means_B, peaks_B, covs_B, size_a, si
         ax_b.add_artist(con)
 
     plt.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+    return fig
 
 
 def plot_image_homography_warp(im_A, im_B, H):
