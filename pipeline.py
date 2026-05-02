@@ -232,6 +232,7 @@ def _ransac_init_one(
     max_iters: int,
     confidence: float,
     init_backend: str = "cv2",
+    device: str = "cpu",
 ) -> np.ndarray:
     """Run the chosen init backend for a single frame and return a normalized 3x3 H.
 
@@ -240,6 +241,10 @@ def _ransac_init_one(
     three are torch-native; we still return a numpy 3x3 here so callers
     that operate in numpy land (legacy ``optimize_homography``) work
     unchanged.
+
+    ``device`` controls where the torch tensors are built for the
+    non-cv2 paths. Pass ``"cuda"`` from a CUDA pipeline so kornia /
+    torch_ransac runs on GPU instead of paying a host round-trip.
     """
     target = means_B if use_means else (peaks_B if peaks_B is not None else means_B)
 
@@ -252,11 +257,12 @@ def _ransac_init_one(
             return np.eye(3, dtype=np.float64)
         return H / H[2, 2]
 
-    # Torch-native paths. Build a (1, N, 2) batched tensor on CPU; the
-    # caller might re-upload to GPU later but for single-frame init this
-    # is fine.
-    pts_A_t = torch.from_numpy(pts_A.astype(np.float64)).unsqueeze(0)
-    pts_B_t = torch.from_numpy(target.astype(np.float64)).unsqueeze(0)
+    # Torch-native paths. Build (1, N, 2) tensors on the requested device
+    # so kornia / torch_ransac actually run on GPU when the caller asked
+    # for it (was forcing CPU here, defeating the batched/GPU init point).
+    target_device = torch.device(device)
+    pts_A_t = torch.from_numpy(pts_A.astype(np.float64)).to(target_device).unsqueeze(0)
+    pts_B_t = torch.from_numpy(target.astype(np.float64)).to(target_device).unsqueeze(0)
 
     with torch.no_grad():
         if init_backend == "kornia_dlt":
@@ -339,6 +345,23 @@ def estimate_homography(
             return H_eye
 
         if refine:
+            if init_backend != "cv2":
+                # scipy's optimize_homography does its own cv2 RANSAC init
+                # internally and doesn't accept an externally-computed H_init.
+                # Honoring init_backend here would require either threading
+                # an H_init through scipy's TRF wrapper (invasive change to
+                # the legacy code) or doing init outside and refining via
+                # the torch-LM (defeats the point of backend="numpy"). Fail
+                # loudly rather than silently ignore the kwarg.
+                raise ValueError(
+                    f"backend='numpy' with refine=True hardwires init via "
+                    f"cv2.findHomography (scipy.optimize.least_squares does "
+                    f"the chaining internally). init_backend={init_backend!r} "
+                    f"is not honored on this path. Either set "
+                    f"refine=False (returns the chosen init), or switch "
+                    f"backend to 'torch_cpu' / 'torch_cuda' (these honor "
+                    f"init_backend end-to-end)."
+                )
             H, H_init = optimize_homography(
                 pts_A, means_B, covs_B, peaks_B=peaks_B,
                 model=model, verbose=0, quiet=True,
@@ -379,7 +402,7 @@ def estimate_homography(
             pts_A, peaks_B, means_B, use_means_for_ransac,
             ransac_method, ransac_reproj_threshold,
             ransac_max_iters, ransac_confidence,
-            init_backend=init_backend,
+            init_backend=init_backend, device=device,
         )
         if not refine:
             H = H_init
@@ -400,6 +423,94 @@ def estimate_homography(
     if return_details:
         return HomographyResult(H, H_init, pts_A, means_B, peaks_B, covs_B)
     return H
+
+
+def _batched_init_from_gpu(
+    *,
+    gpu_out,
+    counts_cpu: np.ndarray,
+    starts: np.ndarray,
+    init_backend: str,
+    use_means: bool,
+    reproj: float,
+    device: str,
+) -> List[np.ndarray]:
+    """Run a non-cv2 init backend on padded GPU tensors in ONE batched call.
+
+    Bypasses the per-frame Python loop that the cv2 path is forced into
+    (cv2 has no batched API). Pads gpu_out's per-frame correspondence
+    slices to (B, N_max, 2), runs kornia DLT / kornia IRLS / batched
+    torch RANSAC once, returns a list of B numpy 3x3 H matrices.
+
+    Frames with N<4 get identity H (RANSAC over <4 pts is undefined).
+    """
+    B = gpu_out.B
+    N_max = int(counts_cpu.max()) if counts_cpu.size > 0 else 0
+    if N_max < 4:
+        return [np.eye(3, dtype=np.float64) for _ in range(B)]
+
+    # Pad pts_A and the RANSAC target on device using the gpu_out batch_idx.
+    target_dev = torch.device(device)
+    dtype = torch.float64
+
+    pts_src = gpu_out.pts_A.to(dtype=dtype)               # (N_total, 2)
+    pts_tgt_full = (
+        gpu_out.means_B.to(dtype=dtype) if use_means
+        else gpu_out.peaks_B.to(dtype=dtype)
+    )                                                     # (N_total, 2)
+
+    counts_dev = gpu_out.counts.to(target_dev)            # (B,)
+    starts_dev = torch.cat(
+        [torch.zeros(1, dtype=counts_dev.dtype, device=target_dev),
+         counts_dev.cumsum(0)[:-1]],
+    )                                                     # (B,)
+    slot_in_frame = torch.arange(
+        gpu_out.batch_idx.shape[0], device=target_dev,
+    ) - starts_dev[gpu_out.batch_idx]                     # (N_total,)
+
+    pts_A_p = torch.zeros((B, N_max, 2), dtype=dtype, device=target_dev)
+    pts_B_p = torch.zeros((B, N_max, 2), dtype=dtype, device=target_dev)
+    weights = torch.zeros((B, N_max), dtype=dtype, device=target_dev)
+    pts_A_p[gpu_out.batch_idx, slot_in_frame] = pts_src
+    pts_B_p[gpu_out.batch_idx, slot_in_frame] = pts_tgt_full
+    weights[gpu_out.batch_idx, slot_in_frame] = 1.0
+
+    # Frames with N<4: zero-out their weights so kornia DLT ignores them
+    # (we'll overwrite their H with identity below).
+    sparse = (counts_dev < 4)
+    if bool(sparse.any()):
+        weights[sparse] = 0.0
+
+    with torch.no_grad():
+        if init_backend == "kornia_dlt":
+            # Weighted DLT — weights act as RANSAC inlier mask.
+            H_t = dlt_homography_kornia(pts_A_p, pts_B_p, weights=weights)
+        elif init_backend == "kornia_dlt_iter":
+            H_t = dlt_homography_kornia(
+                pts_A_p, pts_B_p, weights=weights, iterated=True,
+            )
+        elif init_backend == "torch_ransac":
+            H_t, _mask = torch_ransac_homography(
+                pts_A_p, pts_B_p,
+                inlier_threshold=reproj,
+                seed=None,
+            )
+        else:
+            raise ValueError(f"Unknown init_backend: {init_backend!r}")
+
+    H_np = H_t.detach().cpu().numpy().astype(np.float64)
+    # Restore identity for sparse frames (kornia/torch_ransac result on
+    # all-zero-weight rows is meaningless).
+    sparse_np = (counts_cpu < 4)
+    H_inits: List[np.ndarray] = []
+    eye = np.eye(3, dtype=np.float64)
+    for b in range(B):
+        if sparse_np[b]:
+            H_inits.append(eye.copy())
+        else:
+            h = H_np[b]
+            H_inits.append(h / h[2, 2])
+    return H_inits
 
 
 # --------------------------------------------------------------------------- #
@@ -551,30 +662,52 @@ def estimate_homography_batched(
             return results, empty_pf
         return results
 
-    pts_A_cpu = gpu_out.pts_A.detach().cpu().numpy().astype(np.float32, copy=False)
-    peaks_B_cpu = gpu_out.peaks_B.detach().cpu().numpy().astype(np.float32, copy=False)
-    means_B_cpu = (
-        gpu_out.means_B.detach().cpu().numpy().astype(np.float32, copy=False)
-        if use_means_for_ransac else None
-    )
     starts = np.concatenate([[0], np.cumsum(counts_cpu)[:-1]]).astype(np.int64)
 
-    H_inits: List[np.ndarray] = []
-    for b in range(B):
-        s = int(starts[b])
-        n = int(counts_cpu[b])
-        if n < 4:
-            H_inits.append(np.eye(3, dtype=np.float64))
-        else:
-            pts = pts_A_cpu[s:s + n]
-            peaks = peaks_B_cpu[s:s + n]
-            mu = means_B_cpu[s:s + n] if use_means_for_ransac else None
-            H_inits.append(_ransac_init_one(
-                pts, peaks, mu, use_means_for_ransac,
-                ransac_method, ransac_reproj_threshold,
-                ransac_max_iters, ransac_confidence,
-                init_backend=init_backend,
-            ))
+    # Cached host copies — populated lazily by the cv2 init path or by the
+    # return_per_frame block below. None until first transfer.
+    pts_A_cpu: Optional[np.ndarray] = None
+    peaks_B_cpu: Optional[np.ndarray] = None
+    means_B_cpu: Optional[np.ndarray] = None
+
+    if init_backend == "cv2":
+        # cv2 path: must transfer pts_A + peaks_B (and means_B if used) to
+        # CPU since cv2 has no GPU/batched API; loop per frame.
+        pts_A_cpu = gpu_out.pts_A.detach().cpu().numpy().astype(np.float32, copy=False)
+        peaks_B_cpu = gpu_out.peaks_B.detach().cpu().numpy().astype(np.float32, copy=False)
+        means_B_cpu = (
+            gpu_out.means_B.detach().cpu().numpy().astype(np.float32, copy=False)
+            if use_means_for_ransac else None
+        )
+        H_inits: List[np.ndarray] = []
+        for b in range(B):
+            s = int(starts[b])
+            n = int(counts_cpu[b])
+            if n < 4:
+                H_inits.append(np.eye(3, dtype=np.float64))
+            else:
+                pts = pts_A_cpu[s:s + n]
+                peaks = peaks_B_cpu[s:s + n]
+                mu = means_B_cpu[s:s + n] if use_means_for_ransac else None
+                H_inits.append(_ransac_init_one(
+                    pts, peaks, mu, use_means_for_ransac,
+                    ransac_method, ransac_reproj_threshold,
+                    ransac_max_iters, ransac_confidence,
+                    init_backend="cv2",
+                ))
+    else:
+        # GPU-resident batched init: stay on device, use the chosen torch
+        # backend in ONE batched call. Skips the GPU→CPU per-frame round
+        # trip cv2 forces.
+        H_inits = _batched_init_from_gpu(
+            gpu_out=gpu_out,
+            counts_cpu=counts_cpu,
+            starts=starts,
+            init_backend=init_backend,
+            use_means=use_means_for_ransac,
+            reproj=ransac_reproj_threshold,
+            device=device,
+        )
 
     history: Optional[LMHistory] = None
     if not refine:
@@ -604,9 +737,15 @@ def estimate_homography_batched(
     per_frame_legacy = None
     if return_per_frame:
         per_frame_legacy = []
-        covs_B_cpu = gpu_out.covs_B.detach().cpu().numpy().astype(np.float32, copy=False)
+        # Lazy bulk transfers — the GPU-resident init path may have skipped
+        # them so far; fill in only what's missing.
+        if pts_A_cpu is None:
+            pts_A_cpu = gpu_out.pts_A.detach().cpu().numpy().astype(np.float32, copy=False)
+        if peaks_B_cpu is None:
+            peaks_B_cpu = gpu_out.peaks_B.detach().cpu().numpy().astype(np.float32, copy=False)
         if means_B_cpu is None:
             means_B_cpu = gpu_out.means_B.detach().cpu().numpy().astype(np.float32, copy=False)
+        covs_B_cpu = gpu_out.covs_B.detach().cpu().numpy().astype(np.float32, copy=False)
         for b in range(B):
             s = int(starts[b])
             n = int(counts_cpu[b])
