@@ -34,6 +34,11 @@ import torch
 
 from .correspondence import find_gaussians
 from .correspondence_torch import find_gaussians_torch, find_gaussians_torch_batch
+from .dlt_ransac import (
+    dlt_homography_kornia,
+    torch_ransac_homography,
+    _KORNIA_OK,
+)
 from .homography import optimize_homography
 from .homography_torch_lm import (
     LMHistory,
@@ -115,6 +120,38 @@ def resolve_ransac_method(name: str) -> int:
     return RANSAC_METHODS[key]
 
 
+# Init-backend names accepted by estimate_homography{,_batched}. Picks
+# WHICH algorithm produces H_init before the LM refinement.
+#
+#   "cv2"          - cv2.findHomography(ransac_method=...). CPU only,
+#                    not differentiable, sequential per frame, but fast
+#                    and outlier-robust. Default.
+#   "kornia_dlt"   - kornia weighted DLT. Batched, GPU, differentiable.
+#                    No outlier rejection — good when correspondences
+#                    are clean.
+#   "kornia_dlt_iter" - kornia IRLS-DLT. Batched, GPU, differentiable.
+#                       Soft outlier down-weighting via IRLS.
+#   "torch_ransac" - hand-rolled batched RANSAC + 4-pt DLT, pure torch.
+#                    Batched, GPU, partially differentiable (sample +
+#                    inlier-count are non-diff; final DLT solve is).
+INIT_BACKENDS: Tuple[str, ...] = ("cv2", "kornia_dlt", "kornia_dlt_iter", "torch_ransac")
+DEFAULT_INIT_BACKEND: str = "cv2"
+
+
+def resolve_init_backend(name: str) -> str:
+    """Validate an init-backend name (defensive — useful behind a CLI flag)."""
+    if name not in INIT_BACKENDS:
+        raise ValueError(
+            f"Unknown init backend {name!r}; choose from {INIT_BACKENDS}."
+        )
+    if name.startswith("kornia") and not _KORNIA_OK:
+        raise ModuleNotFoundError(
+            f"init_backend={name!r} needs kornia. `pip install kornia` "
+            f"or use one of {[b for b in INIT_BACKENDS if not b.startswith('kornia')]}."
+        )
+    return name
+
+
 # --------------------------------------------------------------------------- #
 # Helpers                                                                     #
 # --------------------------------------------------------------------------- #
@@ -194,15 +231,49 @@ def _ransac_init_one(
     reproj: float,
     max_iters: int,
     confidence: float,
+    init_backend: str = "cv2",
 ) -> np.ndarray:
-    """Run cv2 RANSAC for a single frame and return a normalized 3x3 H."""
+    """Run the chosen init backend for a single frame and return a normalized 3x3 H.
+
+    ``init_backend`` selects between cv2.findHomography (default), kornia's
+    DLT / IRLS-DLT, or the hand-rolled batched torch RANSAC. The latter
+    three are torch-native; we still return a numpy 3x3 here so callers
+    that operate in numpy land (legacy ``optimize_homography``) work
+    unchanged.
+    """
     target = means_B if use_means else (peaks_B if peaks_B is not None else means_B)
-    H, _ = cv2.findHomography(
-        pts_A, target, ransac_method,
-        ransacReprojThreshold=reproj, maxIters=max_iters, confidence=confidence,
-    )
-    if H is None:
-        return np.eye(3, dtype=np.float64)
+
+    if init_backend == "cv2":
+        H, _ = cv2.findHomography(
+            pts_A, target, ransac_method,
+            ransacReprojThreshold=reproj, maxIters=max_iters, confidence=confidence,
+        )
+        if H is None:
+            return np.eye(3, dtype=np.float64)
+        return H / H[2, 2]
+
+    # Torch-native paths. Build a (1, N, 2) batched tensor on CPU; the
+    # caller might re-upload to GPU later but for single-frame init this
+    # is fine.
+    pts_A_t = torch.from_numpy(pts_A.astype(np.float64)).unsqueeze(0)
+    pts_B_t = torch.from_numpy(target.astype(np.float64)).unsqueeze(0)
+
+    with torch.no_grad():
+        if init_backend == "kornia_dlt":
+            H_t = dlt_homography_kornia(pts_A_t, pts_B_t)[0]
+        elif init_backend == "kornia_dlt_iter":
+            H_t = dlt_homography_kornia(pts_A_t, pts_B_t, iterated=True)[0]
+        elif init_backend == "torch_ransac":
+            H_t, _mask = torch_ransac_homography(
+                pts_A_t, pts_B_t,
+                inlier_threshold=reproj,
+                seed=None,  # let caller seed via torch.manual_seed if they want
+            )
+            H_t = H_t[0]
+        else:
+            raise ValueError(f"Unknown init_backend: {init_backend!r}")
+
+    H = H_t.cpu().numpy()
     return H / H[2, 2]
 
 
@@ -217,6 +288,7 @@ def estimate_homography(
     backend: str = "numpy",
     model: str = "sRT",
     use_means_for_ransac: bool = False,
+    init_backend: str = DEFAULT_INIT_BACKEND,
     ransac_method: int = cv2.USAC_FAST,
     ransac_reproj_threshold: float = 3.0,
     ransac_max_iters: int = 5000,
@@ -282,6 +354,7 @@ def estimate_homography(
                 pts_A, peaks_B, means_B, use_means_for_ransac,
                 ransac_method, ransac_reproj_threshold,
                 ransac_max_iters, ransac_confidence,
+                init_backend=init_backend,
             )
             H = H_init
 
@@ -306,6 +379,7 @@ def estimate_homography(
             pts_A, peaks_B, means_B, use_means_for_ransac,
             ransac_method, ransac_reproj_threshold,
             ransac_max_iters, ransac_confidence,
+            init_backend=init_backend,
         )
         if not refine:
             H = H_init
@@ -339,6 +413,7 @@ def estimate_homography_batched(
     backend: str = "torch_cuda",
     model: str = "sRT",
     use_means_for_ransac: bool = False,
+    init_backend: str = DEFAULT_INIT_BACKEND,
     ransac_method: int = cv2.USAC_FAST,
     ransac_reproj_threshold: float = 3.0,
     ransac_max_iters: int = 5000,
@@ -414,6 +489,7 @@ def estimate_homography_batched(
             res = estimate_homography(
                 logits[b], backend="numpy", model=model,
                 use_means_for_ransac=use_means_for_ransac,
+                init_backend=init_backend,
                 ransac_method=ransac_method,
                 ransac_reproj_threshold=ransac_reproj_threshold,
                 ransac_max_iters=ransac_max_iters,
@@ -497,6 +573,7 @@ def estimate_homography_batched(
                 pts, peaks, mu, use_means_for_ransac,
                 ransac_method, ransac_reproj_threshold,
                 ransac_max_iters, ransac_confidence,
+                init_backend=init_backend,
             ))
 
     history: Optional[LMHistory] = None
