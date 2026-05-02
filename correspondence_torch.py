@@ -23,7 +23,8 @@ Returned arrays have the exact same shape semantics as the numpy version:
 
 from __future__ import annotations
 
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Tuple, Union
 
 import numpy as np
 import torch
@@ -360,37 +361,59 @@ def find_gaussians_torch(
 # --------------------------------------------------------------------------- #
 
 
+@dataclass
+class GaussiansBatchTensors:
+    """GPU-resident batched extractor output.
+
+    All tensors stay on the same device as the input ``logits`` and share
+    the same first dim ``N_total`` (sum of per-frame correspondence counts).
+    ``batch_idx[k]`` says which frame peak ``k`` belongs to (sorted, so per-
+    frame slices are contiguous).
+
+    Use :func:`pad_for_batched_lm_from_gpu` (in homography_torch_lm) to pack
+    these into the (B, N_max, ...) padded tensors needed by the batched LM —
+    no host round-trip.
+    """
+    pts_A: torch.Tensor       # (N_total, 2) float32
+    means_B: torch.Tensor     # (N_total, 2) float32
+    peaks_B: torch.Tensor     # (N_total, 2) float32
+    covs_B: torch.Tensor      # (N_total, 2, 2) float32
+    batch_idx: torch.Tensor   # (N_total,)    int64 — frame index for each peak
+    counts: torch.Tensor      # (B,)          int64 — how many peaks per frame
+    B: int                    # batch size (for downstream sanity checks)
+
+
 def find_gaussians_torch_batch(
     tensor: torch.Tensor,
     fixed_threshold: float = 0.008,
     fixed_window_size: int = 4,
     device: str | torch.device = "cpu",
-) -> list[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    return_tensors: bool = False,
+):
     """Batched version of :func:`find_gaussians_torch`.
 
     Processes a stack of B logit tensors in ONE batched torch pass (softmax,
     blur, max-pool, peak-window gather, moments — all done once across
-    ``B * in_h * in_w`` patches). Returns a Python list of B per-frame
-    ``(pts_A, means_B, peaks_B, covs_B)`` numpy tuples, matching the
-    single-frame :func:`find_gaussians_torch` contract per element.
+    ``B * in_h * in_w`` patches).
 
     Parameters
     ----------
     tensor : torch.Tensor
         Logits of shape ``(B, M, in_h, in_w)`` where ``M = out_patch_dim**2``.
-
     fixed_threshold, fixed_window_size, device
         Same meaning as in :func:`find_gaussians_torch`. The batched path
         only supports the fixed-window variant — ``adaptive_gauss_fit`` is
         not exposed because per-peak adaptive iteration cannot be vectorized
         cleanly.
+    return_tensors : bool
+        If ``False`` (default, kept for backward compat), return a Python
+        list of B ``(pts_A, means_B, peaks_B, covs_B)`` numpy tuples — this
+        forces a GPU→CPU transfer of every per-frame array.
 
-    Returns
-    -------
-    list of tuples
-        One ``(pts_A, means_B, peaks_B, covs_B)`` numpy tuple per batch
-        element. Frames with zero detected correspondences return arrays of
-        shape ``(0, 2)`` / ``(0, 2, 2)``.
+        If ``True``, return a :class:`GaussiansBatchTensors` whose tensors
+        stay on ``device``. Use this when the downstream consumer (e.g.
+        :func:`pad_for_batched_lm_from_gpu` + the batched torch-LM) is also
+        on GPU — eliminates the GPU→CPU→GPU round-trip.
 
     Notes
     -----
@@ -463,7 +486,19 @@ def find_gaussians_torch_batch(
     empty_pts = np.zeros((0, 2), dtype=np.float32)
     empty_cov = np.zeros((0, 2, 2), dtype=np.float32)
 
+    def _empty_tensor_result() -> GaussiansBatchTensors:
+        z2 = torch.zeros((0, 2), dtype=work_dtype, device=target_device)
+        z22 = torch.zeros((0, 2, 2), dtype=work_dtype, device=target_device)
+        return GaussiansBatchTensors(
+            pts_A=z2, means_B=z2.clone(), peaks_B=z2.clone(), covs_B=z22,
+            batch_idx=torch.zeros((0,), dtype=torch.long, device=target_device),
+            counts=torch.zeros((B,), dtype=torch.long, device=target_device),
+            B=B,
+        )
+
     if not bool(peaks_mask.any()):
+        if return_tensors:
+            return _empty_tensor_result()
         return [
             (empty_pts.copy(), empty_pts.copy(), empty_pts.copy(), empty_cov.copy())
             for _ in range(B)
@@ -496,6 +531,8 @@ def find_gaussians_torch_batch(
         m11 = m11[keep]; m20 = m20[keep]; m02 = m02[keep]
 
     if patch_idx.numel() == 0:
+        if return_tensors:
+            return _empty_tensor_result()
         return [
             (empty_pts.copy(), empty_pts.copy(), empty_pts.copy(), empty_cov.copy())
             for _ in range(B)
@@ -529,6 +566,17 @@ def find_gaussians_torch_batch(
         ],
         dim=1,
     )                                                                # (N_total, 2, 2)
+
+    if return_tensors:
+        # Per-frame counts for downstream padding. bincount needs a contiguous
+        # 0..B-1 range; we know batch_idx is sorted (see comment below) so a
+        # single GPU op suffices.
+        counts = torch.bincount(batch_idx, minlength=B)              # (B,)
+        return GaussiansBatchTensors(
+            pts_A=pts_A_all, means_B=means_B_all,
+            peaks_B=peaks_B_all, covs_B=covs_B_all,
+            batch_idx=batch_idx, counts=counts, B=B,
+        )
 
     # One bulk transfer to host, then per-frame slicing in numpy (cheap).
     batch_idx_np = batch_idx.detach().cpu().numpy()

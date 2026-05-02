@@ -44,7 +44,31 @@ import cv2
 import numpy as np
 import torch
 
-import theseus as th  # noqa: E402
+# Lazy theseus import: ``ransac_multimodel.pipeline`` and
+# ``ransac_multimodel.homography_torch_lm`` reuse helpers from this file
+# (Mahalanobis residual, sRT->H, RANSAC init, etc.) that don't actually use
+# theseus. Letting `import theseus` raise at module-load time would cascade
+# and crash even the numpy / torch-LM only paths. Defer the import; the
+# theseus-using public functions check ``_TH_IMPORT_ERROR`` and raise a
+# clear error when actually called.
+try:
+    import theseus as th  # noqa: E402
+    _TH_IMPORT_ERROR: Optional[BaseException] = None
+except Exception as _exc:  # pragma: no cover — exercised only when theseus missing
+    th = None  # type: ignore[assignment]
+    _TH_IMPORT_ERROR = _exc
+
+
+def _require_theseus() -> None:
+    if _TH_IMPORT_ERROR is not None:
+        raise ModuleNotFoundError(
+            "theseus is not importable in this environment "
+            f"({_TH_IMPORT_ERROR!r}). Install the vendored theseus checkout "
+            "(see CLAUDE.md) or use a non-theseus backend "
+            "(homography.optimize_homography or "
+            "homography_torch_lm.refine_homography_torch_lm_torch)."
+        )
+
 
 from .parity_utils import np_to_torch, torch_to_np
 
@@ -197,6 +221,7 @@ def _build_layer(
     dtype: torch.dtype,
 ):
     """Return (theseus_layer, optim_var_name, residual_dim)."""
+    _require_theseus()
     param_dim = 4 if model == "sRT" else 8
     # One Mahalanobis-Huber residual per correspondence, plus 2*param_dim
     # one-sided barrier residuals (over_i and under_i for each sRT variable).
