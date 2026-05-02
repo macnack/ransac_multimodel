@@ -89,7 +89,7 @@ def optimize_homography(
     use_means_for_ransac=False,
     verbose=0,
     quiet=False,
-    ransac_method=cv2.RANSAC,
+    ransac_method=cv2.USAC_FAST,
     ransac_reproj_threshold=3.0,
     ransac_max_iters=5000,
     ransac_confidence=0.995,

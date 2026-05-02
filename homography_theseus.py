@@ -64,9 +64,14 @@ def _project_points_torch(H: torch.Tensor, pts: torch.Tensor) -> torch.Tensor:
 
 
 def _srt_to_matrix_batch(params: torch.Tensor) -> torch.Tensor:
-    """params: (B,4) [s, theta, tx, ty]. Returns H (B,3,3)."""
-    s = torch.clamp(params[:, 0], 0.0, 4.0)
-    theta = torch.clamp(params[:, 1], math.radians(-90.0), math.radians(90.0))
+    """params: (B,4) [s, theta, tx, ty]. Returns H (B,3,3).
+
+    No clamp on s/theta — the soft barrier penalty handles bounds and clamp
+    here would silently zero out the gradient flowing back from the barrier
+    into the LM update direction.
+    """
+    s = params[:, 0]
+    theta = params[:, 1]
     tx = params[:, 2]
     ty = params[:, 3]
     c, si = torch.cos(theta), torch.sin(theta)
@@ -109,15 +114,23 @@ def _huber_robust_residual(maha: torch.Tensor, f_scale: float) -> torch.Tensor:
     pseudo-residual so that 0.5 * sum(robust^2) == 0.5 * sum(huber(maha^2)).
 
     Matches scipy.optimize.least_squares(loss="huber", f_scale=s):
-        z = (maha / s)^2
-        rho(z) = z         if z <= 1
-                 2*sqrt(z) - 1 otherwise
-        robust_residual = s * sqrt(rho(z))
+        rho(z) = z if z <= 1 else 2*sqrt(z) - 1   with z = (maha/s)^2
+        robust = s * sqrt(rho(z))
+
+    Closed form per branch:
+        |maha| <= s :  robust = |maha|              (because sqrt(z)*s = |maha|)
+        |maha| >  s :  robust = sqrt(2*s*|maha| - s^2)
+
+    This avoids torch.where through compound expressions whose disabled
+    branch can still backprop a noisy gradient near the boundary, and drops
+    the +1e-12 magic numbers (both branches are smooth and well-defined for
+    maha >= 0).
     """
     s = float(f_scale)
-    z = (maha / s) ** 2
-    rho = torch.where(z <= 1.0, z, 2.0 * torch.sqrt(z + 1e-12) - 1.0)
-    return s * torch.sqrt(rho + 1e-12)
+    abs_m = maha.abs()
+    quad = abs_m
+    lin = torch.sqrt(torch.clamp(2.0 * s * abs_m - s * s, min=0.0))
+    return torch.where(abs_m <= s, quad, lin)
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +333,7 @@ def optimize_homography_theseus(
     use_means_for_ransac: bool = False,
     verbose: int = 0,
     quiet: bool = False,
-    ransac_method: int = cv2.RANSAC,
+    ransac_method: int = cv2.USAC_FAST,
     ransac_reproj_threshold: float = 3.0,
     ransac_max_iters: int = 5000,
     ransac_confidence: float = 0.995,

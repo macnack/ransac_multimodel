@@ -101,6 +101,8 @@ def _batched_lm(
     params = params0
     damping = torch.full((B,), init_damping, device=device, dtype=dtype)
     prev_cost = None
+    abs_tol_t = torch.tensor(abs_tol, device=device, dtype=dtype)
+    rel_tol_t = torch.tensor(rel_tol, device=device, dtype=dtype)
 
     for _ in range(max_iter):
         r = res_fn(params, pts_A, means_B, L)        # (B, R)
@@ -109,9 +111,14 @@ def _batched_lm(
         cost = 0.5 * (r * r).sum(dim=-1)             # (B,)
 
         if prev_cost is not None:
-            change = (prev_cost - cost).abs().max()
-            ratio = change / (prev_cost.abs().max() + 1e-30)
-            if float(change) < abs_tol or float(ratio) < rel_tol:
+            # Per-batch convergence: bool tensor stays on device. We sync
+            # exactly once via .all().item() — the previous code synced
+            # twice per iter via float(change) and float(ratio), and the
+            # CUDA round-trip dominated runtime at small problem sizes.
+            change = (prev_cost - cost).abs()
+            ratio = change / (prev_cost.abs() + 1e-30)
+            converged = (change < abs_tol_t) | (ratio < rel_tol_t)
+            if bool(converged.all()):
                 break
         prev_cost = cost
 
@@ -172,7 +179,6 @@ def refine_homography_torch_lm_torch(
         covs_B = covs_B.unsqueeze(0)
         H_init = H_init.unsqueeze(0)
 
-    B, N, _ = pts_A.shape
     device, dtype = pts_A.device, pts_A.dtype
 
     # Whitening factor: chol(inv(cov + eps*I)).
@@ -181,6 +187,44 @@ def refine_homography_torch_lm_torch(
     inv_covs = torch.linalg.inv(covs_safe)
     inv_covs = 0.5 * (inv_covs + inv_covs.transpose(-1, -2))
     L = torch.linalg.cholesky(inv_covs)              # (B, N, 2, 2)
+
+    return _refine_from_L(
+        pts_A, means_B, L, H_init,
+        model=model, f_scale=f_scale,
+        srt_bounds_low=srt_bounds_low, srt_bounds_high=srt_bounds_high,
+        barrier_k=barrier_k, barrier_alpha=barrier_alpha,
+        max_iter=max_iter, init_damping=init_damping,
+        damping_up=damping_up, damping_down=damping_down,
+        abs_err_tolerance=abs_err_tolerance, rel_err_tolerance=rel_err_tolerance,
+    )
+
+
+def _refine_from_L(
+    pts_A: torch.Tensor,
+    means_B: torch.Tensor,
+    L: torch.Tensor,
+    H_init: torch.Tensor,
+    *,
+    model: str,
+    f_scale: float,
+    srt_bounds_low: tuple,
+    srt_bounds_high: tuple,
+    barrier_k: float,
+    barrier_alpha: float,
+    max_iter: int,
+    init_damping: float,
+    damping_up: float,
+    damping_down: float,
+    abs_err_tolerance: float,
+    rel_err_tolerance: float,
+) -> torch.Tensor:
+    """Internal: run the LM given a precomputed Cholesky factor L of inv(cov).
+
+    Lets ``optimize_homography_torch_lm`` reuse the L it already built from
+    numpy without round-tripping through ``cov`` and re-Cholesky'ing.
+    """
+    B, N, _ = pts_A.shape
+    device, dtype = pts_A.device, pts_A.dtype
 
     H0 = H_init / H_init[..., 2:3, 2:3]
     if model == "sRT":
@@ -199,17 +243,10 @@ def refine_homography_torch_lm_torch(
     err_fn = _err_fn_factory(model, f_scale, bounds_low, bounds_high, barrier_scale)
 
     params_opt = _batched_lm(
-        params0,
-        pts_A,
-        means_B,
-        L,
-        err_fn,
-        max_iter=max_iter,
-        init_damping=init_damping,
-        damping_up=damping_up,
-        damping_down=damping_down,
-        abs_tol=abs_err_tolerance,
-        rel_tol=rel_err_tolerance,
+        params0, pts_A, means_B, L, err_fn,
+        max_iter=max_iter, init_damping=init_damping,
+        damping_up=damping_up, damping_down=damping_down,
+        abs_tol=abs_err_tolerance, rel_tol=rel_err_tolerance,
     )
 
     if model == "sRT":
@@ -227,7 +264,7 @@ def optimize_homography_torch_lm(
     model: str = "full",
     use_means_for_ransac: bool = False,
     quiet: bool = False,
-    ransac_method: int = cv2.RANSAC,
+    ransac_method: int = cv2.USAC_FAST,
     ransac_reproj_threshold: float = 3.0,
     ransac_max_iters: int = 5000,
     ransac_confidence: float = 0.995,
@@ -270,37 +307,21 @@ def optimize_homography_torch_lm(
     )
 
     L_np = _chol_inv_cov(covs_B.astype(np.float64))
-    init_params = _params_init_from_H(H_init_norm, model)
 
     pts_A_t = np_to_torch(pts_A.astype(np.float64), device=device, dtype=dtype).reshape(1, N, 2)
     means_B_t = np_to_torch(means_B.astype(np.float64), device=device, dtype=dtype).reshape(1, N, 2)
     L_t = np_to_torch(L_np, device=device, dtype=dtype).reshape(1, N, 2, 2)
     H_init_t = np_to_torch(H_init_norm, device=device, dtype=dtype).reshape(1, 3, 3)
 
-    # Use covs_B as input shape to the differentiable wrapper, but we already
-    # have L; build a covs tensor that re-cholesky's to the same L by passing
-    # inv(L L^T) — round-trip wastes a bit but keeps the entrypoints uniform.
-    inv_LtL = torch.linalg.inv(L_t @ L_t.transpose(-1, -2))
-    inv_LtL = 0.5 * (inv_LtL + inv_LtL.transpose(-1, -2))
-
     with torch.no_grad():
-        H_opt_t = refine_homography_torch_lm_torch(
-            pts_A_t,
-            means_B_t,
-            inv_LtL,
-            H_init_t,
-            model=model,
-            f_scale=f_scale,
-            srt_bounds_low=srt_bounds_low,
-            srt_bounds_high=srt_bounds_high,
-            barrier_k=barrier_k,
-            barrier_alpha=barrier_alpha,
-            max_iter=max_iter,
-            init_damping=init_damping,
-            damping_up=damping_up,
-            damping_down=damping_down,
-            abs_err_tolerance=abs_err_tolerance,
-            rel_err_tolerance=rel_err_tolerance,
+        H_opt_t = _refine_from_L(
+            pts_A_t, means_B_t, L_t, H_init_t,
+            model=model, f_scale=f_scale,
+            srt_bounds_low=srt_bounds_low, srt_bounds_high=srt_bounds_high,
+            barrier_k=barrier_k, barrier_alpha=barrier_alpha,
+            max_iter=max_iter, init_damping=init_damping,
+            damping_up=damping_up, damping_down=damping_down,
+            abs_err_tolerance=abs_err_tolerance, rel_err_tolerance=rel_err_tolerance,
         )[0]
 
     H_opt = torch_to_np(H_opt_t)
