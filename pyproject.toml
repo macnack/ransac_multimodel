@@ -1,0 +1,76 @@
+# PEP 621 packaging for ransac_multimodel.
+#
+# The submodule layout is unusual: this directory IS the importable Python
+# package (there's an __init__.py here, no `src/` or nested
+# `ransac_multimodel/` subdir). We map `ransac_multimodel` -> `.` so the
+# resulting wheel contains a top-level `ransac_multimodel/` package whose
+# contents are the files in this directory.
+#
+# Install from a downstream project:
+#
+#   # editable, with a local clone:
+#   pip install -e <path/to/ransac_multimodel>
+#
+#   # straight from git:
+#   pip install "ransac-multimodel @ git+ssh://git@github.com/macnack/ransac_multimodel.git@feat/installable-package"
+#
+# After install, downstream code uses the public surface re-exported from
+# ransac_multimodel/__init__.py:
+#
+#   from ransac_multimodel import (
+#       estimate_homography, estimate_homography_batched,
+#       BACKENDS, RANSAC_METHODS,
+#       resolve_backend, resolve_ransac_method,
+#       BatchedHomographyResult, HomographyResult,
+#   )
+
+[project]
+name = "ransac-multimodel"
+version = "0.1.0"
+description = "Differentiable, batched homography refinement from Gaussian correspondence heatmaps."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "macnack" }]
+keywords = ["homography", "ransac", "differentiable", "torch", "computer-vision"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+
+# Hard runtime deps. theseus is intentionally NOT here — homography_theseus
+# uses a lazy import and the rest of the package works without it.
+dependencies = [
+    "numpy>=1.22",
+    "scipy>=1.9",
+    "opencv-python>=4.5",
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+# Pull in matplotlib only when the user wants the plotting helpers.
+plotting = ["matplotlib>=3.5"]
+# Pull in optuna only when the user wants the SAT-ROMA tuning runner.
+tuning = ["optuna>=3.0"]
+# Pull in everything (handy for development / running benchmarks).
+all = ["matplotlib>=3.5", "optuna>=3.0"]
+
+[project.urls]
+Homepage = "https://github.com/macnack/ransac_multimodel"
+Repository = "https://github.com/macnack/ransac_multimodel"
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# Flat layout: the repo root IS the package. Map the import name
+# `ransac_multimodel` to "." and list it explicitly (find_packages can't
+# discover the package because there's no subdirectory by that name —
+# the dir holding this pyproject.toml IS the package).
+package-dir = { "ransac_multimodel" = "." }
+packages = ["ransac_multimodel"]
+include-package-data = false
