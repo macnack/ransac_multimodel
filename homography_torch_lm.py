@@ -64,6 +64,40 @@ class LMHistory:
     converged: torch.Tensor                  # (B,) bool — final per-batch convergence flag
     final_cost: torch.Tensor                 # (B,) — convenience, == cost[-1]
 
+    def to_numpy(self) -> "NumpyLMHistory":
+        """Convert to NumpyLMHistory for use with divergence guard (pure numpy).
+
+        Detaches from autograd and moves to CPU as needed. Zero-copy for tensors
+        already on CPU; ~B*40 bytes for typical batches.
+        """
+        from .divergence_guard import NumpyLMHistory
+
+        return NumpyLMHistory(
+            cost_init=self.cost[0].detach().cpu().numpy().astype(np.float64),
+            cost_final=self.final_cost.detach().cpu().numpy().astype(np.float64),
+            n_iters=self.n_iters,
+            converged=self.converged.detach().cpu().numpy().astype(bool),
+        )
+
+
+def lm_history_to_numpy(history: LMHistory) -> "NumpyLMHistory":
+    """Convert torch LMHistory to numpy NumpyLMHistory for divergence guard.
+
+    Standalone version of LMHistory.to_numpy(); useful when you have the
+    history but not access to call the method directly.
+
+    Parameters
+    ----------
+    history
+        LMHistory from refine_homography_torch_lm_torch.
+
+    Returns
+    -------
+    NumpyLMHistory
+        Pure numpy, ready for apply_divergence_guard.
+    """
+    return history.to_numpy()
+
 
 def _err_fn_factory(
     model: str,

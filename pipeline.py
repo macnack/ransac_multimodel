@@ -34,6 +34,10 @@ import torch
 
 from .correspondence import find_gaussians
 from .correspondence_torch import find_gaussians_torch, find_gaussians_torch_batch
+from .divergence_guard import (
+    DivergenceGuardConfig,
+    apply_divergence_guard,
+)
 from .dlt_ransac import (
     dlt_homography_kornia,
     torch_ransac_homography,
@@ -42,6 +46,7 @@ from .dlt_ransac import (
 from .homography import optimize_homography
 from .homography_torch_lm import (
     LMHistory,
+    lm_history_to_numpy,
     pad_for_batched_lm,
     pad_for_batched_lm_from_gpu,
     refine_homography_torch_lm_torch,
@@ -205,11 +210,17 @@ class BatchedHomographyResult:
       per_frame: Optional[list of (pts_A, means_B, peaks_B, covs_B) numpy
                  tuples] — per-frame extracted correspondences; None when
                  return_per_frame=False.
+      mask_diverged: Optional[np.ndarray] — (B,) bool, True where divergence
+                 guard reverted to H_init; None when divergence_guard=None.
+      guard_reasons: Optional[list[dict]] — per-sample audit trail from
+                 divergence guard; None when divergence_guard=None.
     """
     H: np.ndarray
     H_init: np.ndarray
     history: Optional["LMHistory"] = None
     per_frame: Optional[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = None
+    mask_diverged: Optional[np.ndarray] = None  # (B,) bool when guard active
+    guard_reasons: Optional[List[dict]] = None  # list of dicts when guard active
 
 
 def _resolve_torch_device(backend: str) -> str:
@@ -304,6 +315,7 @@ def estimate_homography(
     f_scale: float = 2.0,
     max_iter: int = 100,
     refine: bool = True,
+    lm_kwargs: Optional[dict] = None,
     return_details: bool = False,
 ) -> Union[np.ndarray, HomographyResult]:
     """End-to-end refinement for a single ``(M, in_h, in_w)`` logit tensor.
@@ -329,6 +341,15 @@ def estimate_homography(
         ``False``, skip the LM step and return the RANSAC init H. Useful
         when you want a cheap estimate (RANSAC alone is ~0.1ms vs ~25ms
         for LM at single-frame, batched at higher B's).
+    lm_kwargs
+        Optional dict of extra keyword arguments forwarded verbatim to
+        :func:`refine_homography_torch_lm_torch` (init_damping, damping_up,
+        damping_down, barrier_k, srt_bounds_low, srt_bounds_high,
+        abs_err_tolerance, rel_err_tolerance, ...). Only takes effect on
+        torch backends with ``refine=True``; ignored on the numpy/scipy
+        path. Putting a key already in the explicit signature
+        (``f_scale``, ``max_iter``, ``model``) raises
+        ``TypeError: multiple values for keyword argument``.
     """
     if backend == "numpy":
         pts_A, means_B, peaks_B, covs_B = find_gaussians(
@@ -415,6 +436,7 @@ def estimate_homography(
                 H_t = refine_homography_torch_lm_torch(
                     pts_A_t, means_B_t, covs_B_t, H_init_t,
                     model=model, f_scale=f_scale, max_iter=max_iter,
+                    **(lm_kwargs or {}),
                 )
             H = H_t[0].detach().cpu().numpy()
     else:
@@ -534,10 +556,12 @@ def estimate_homography_batched(
     f_scale: float = 2.0,
     max_iter: int = 100,
     refine: bool = True,
+    lm_kwargs: Optional[dict] = None,
     track_history: bool = False,
     logger=None,
     return_per_frame: bool = False,
     return_result: bool = False,
+    divergence_guard: Optional[DivergenceGuardConfig] = None,
 ):
     """Batched end-to-end refinement for ``(B, M, in_h, in_w)`` logits.
 
@@ -575,6 +599,20 @@ def estimate_homography_batched(
         alternative to the tuple-return modes (which grow in arity as more
         opt-in fields land — calling code stays unchanged when you start
         accessing more fields on the dataclass).
+    lm_kwargs
+        Optional dict of extra keyword arguments forwarded verbatim to
+        :func:`refine_homography_torch_lm_torch` on the torch backends
+        (e.g. ``{"init_damping": 1e-2, "damping_up": 3.0, "barrier_k": 2.0,
+        "abs_err_tolerance": 1e-9}``). Same caveats as on the single-frame
+        version: torch + ``refine=True`` only; conflicts with explicit
+        params raise ``TypeError``.
+    divergence_guard
+        Optional :class:`DivergenceGuardConfig`. If set, post-refine H is
+        checked for divergence (cost increase, extreme jumps, degenerate det).
+        Samples that diverge fall back to H_init. Only applies when
+        ``refine=True``. When enabled, ``track_history=True`` is promoted
+        internally (guard needs cost trajectory). Results include ``mask_diverged``
+        and ``guard_reasons`` fields in BatchedHomographyResult.
     """
     if logits.dim() != 4:
         raise ValueError(f"Batched logits must be (B, M, in_h, in_w), got {tuple(logits.shape)}")
@@ -609,6 +647,7 @@ def estimate_homography_batched(
                 fixed_window_size=fixed_window_size,
                 f_scale=f_scale, max_iter=max_iter,
                 refine=refine,
+                lm_kwargs=lm_kwargs,
                 return_details=True,
             )
             results[b] = res.H
@@ -620,6 +659,8 @@ def estimate_homography_batched(
                 H=results, H_init=results_init,
                 history=None,  # numpy backend doesn't surface LM history
                 per_frame=per_frame_out if return_per_frame else None,
+                mask_diverged=None,  # divergence_guard not supported on numpy backend
+                guard_reasons=None,
             )
         if return_per_frame:
             return results, per_frame_out
@@ -710,6 +751,13 @@ def estimate_homography_batched(
         )
 
     history: Optional[LMHistory] = None
+    mask_diverged = None
+    guard_reasons = None
+
+    # If divergence guard is active, we need history to check cost trajectory
+    need_history_for_guard = divergence_guard is not None and refine
+    effective_track_history = track_history or need_history_for_guard
+
     if not refine:
         # Skip LM, just return the stacked RANSAC inits.
         H_np = np.stack(H_inits).astype(np.float64)
@@ -724,13 +772,22 @@ def estimate_homography_batched(
                 pts_A_p, means_B_p, covs_B_p, H_init_p,
                 mask=mask, model=model,
                 f_scale=f_scale, max_iter=max_iter,
-                track_history=track_history, logger=logger,
+                track_history=effective_track_history, logger=logger,
+                **(lm_kwargs or {}),
             )
-        if track_history:
+        if effective_track_history:
             H_t, history = lm_out
         else:
             H_t = lm_out
         H_np = H_t.detach().cpu().numpy()
+
+        # Apply divergence guard if configured
+        if divergence_guard is not None and history is not None:
+            H_init_np = np.stack(H_inits).astype(np.float64)
+            history_np = lm_history_to_numpy(history)
+            H_np, mask_diverged, guard_reasons = apply_divergence_guard(
+                H_init_np, H_np, history_np, divergence_guard
+            )
 
     # Build per_frame list eagerly when ANY downstream consumer wants it
     # (legacy return_per_frame OR return_result with return_per_frame).
@@ -760,6 +817,7 @@ def estimate_homography_batched(
         return BatchedHomographyResult(
             H=H_np, H_init=H_init_np,
             history=history, per_frame=per_frame_legacy,
+            mask_diverged=mask_diverged, guard_reasons=guard_reasons,
         )
 
     extras: List = []
