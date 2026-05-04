@@ -34,11 +34,11 @@ from .homography_theseus import (
     _full_h_to_matrix_batch,
     _huber_robust_residual,
     _params_init_from_H,
-    _ransac_init,
     _srt_to_matrix_batch,
     _whitened_mahalanobis_resid,
 )
 from .parity_utils import np_to_torch, torch_to_np
+from .ransac_init import ransac_init
 
 
 @dataclass
@@ -469,16 +469,19 @@ def optimize_homography_torch_lm(
     if N < 4:
         raise ValueError("At least 4 points are required to compute a homography.")
 
-    H_init_norm, _inlier_mask = _ransac_init(
+    if use_means_for_ransac:
+        ransac_pts_B = means_B
+    else:
+        ransac_pts_B = peaks_B if peaks_B is not None else means_B
+
+    H_init, H_init_norm = ransac_init(
         pts_A,
-        means_B,
-        peaks_B if peaks_B is None else np.asarray(peaks_B),
-        use_means_for_ransac,
-        ransac_method,
-        ransac_reproj_threshold,
-        ransac_max_iters,
-        ransac_confidence,
-        quiet,
+        ransac_pts_B,
+        method=ransac_method,
+        reproj_threshold=ransac_reproj_threshold,
+        max_iters=ransac_max_iters,
+        confidence=ransac_confidence,
+        quiet=quiet,
     )
 
     L_np = _chol_inv_cov(covs_B.astype(np.float64))

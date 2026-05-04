@@ -1,6 +1,10 @@
 import numpy as np
 
-from .gaussian_fit import extract_gaussians_adaptive, extract_gaussians_from_heatmap2
+from .gaussian_extraction import (
+    softmax_heatmaps,
+    process_patches,
+    assemble_correspondences,
+)
 
 
 def find_gaussians(
@@ -21,69 +25,35 @@ def find_gaussians(
     """
     Fit Gaussians to every patch heatmap in *tensor* and return correspondences.
     """
-    import torch
+    # Apply softmax to tensor and extract patch dimensions
+    tensor_softmax, out_patch_size = softmax_heatmaps(tensor)
 
-    dict_of_gaussians = {}
-    out_patch_size = int(tensor.shape[0] ** 0.5)
-    assert out_patch_size * out_patch_size == tensor.shape[0], (
-        "Tensor's first dimension must be a perfect square."
+    # Extract Gaussians per patch
+    dict_of_gaussians = process_patches(
+        tensor_softmax,
+        adaptive_gauss_fit=adaptive_gauss_fit,
+        adaptive_threshold=adaptive_threshold,
+        adaptive_n_sigma=adaptive_n_sigma,
+        adaptive_max_iter=adaptive_max_iter,
+        adaptive_min_half_w=adaptive_min_half_w,
+        adaptive_max_half_w=adaptive_max_half_w,
+        fixed_threshold=fixed_threshold,
+        fixed_window_size=fixed_window_size,
+        log_missing_gaussians=False,  # Will handle logging after plotting
+        missing_gaussians_logger=None,
     )
 
-    for py in range(tensor.shape[1]):
-        for px in range(tensor.shape[2]):
-            heatmap = tensor[:, py, px]
-            heatmap = torch.softmax(heatmap.float(), dim=0).numpy()
-            heatmap = heatmap.reshape(out_patch_size, out_patch_size)
+    # Handle optional plotting (before logging missing Gaussians)
+    if plot_heatmaps and plotter is not None:
+        for (px, py), gaussians in dict_of_gaussians.items():
+            heatmap = tensor_softmax[:, py, px].reshape(out_patch_size, out_patch_size)
+            plotter(heatmap, gaussians, px, py)
 
-            if adaptive_gauss_fit:
-                gaussians = extract_gaussians_adaptive(
-                    heatmap,
-                    threshold=adaptive_threshold,
-                    n_sigma=adaptive_n_sigma,
-                    max_iter=adaptive_max_iter,
-                    min_half_w=adaptive_min_half_w,
-                    max_half_w=adaptive_max_half_w,
-                )
-            else:
-                gaussians = extract_gaussians_from_heatmap2(
-                    heatmap,
-                    threshold=fixed_threshold,
-                    window_size=fixed_window_size,
-                )
-
-            coord = (px, py)
-            dict_of_gaussians[coord] = gaussians
-
-            if plot_heatmaps and plotter is not None:
-                plotter(heatmap, gaussians, px, py)
-
-    correspondences_A = []
-    correspondences_B_mu = []
-    correspondences_B_peak = []
-    correspondences_B_cov = []
-
-    for (px, py), gaussians in dict_of_gaussians.items():
-        if not gaussians:
-            if log_missing_gaussians:
-                print(f"No Gaussians found in patch ({px}, {py})")
-            if missing_gaussians_logger is not None:
-                missing_gaussians_logger(px, py)
-            continue
-
-        for g in gaussians:
-            lx, ly = g["mean"]
-
-            correspondences_A.append([float(px), float(py)])
-            correspondences_B_mu.append([lx, ly])
-
-            peak = g["global_peak"]
-            correspondences_B_peak.append([float(peak[0]), float(peak[1])])
-
-            correspondences_B_cov.append(np.array(g["cov"]))
-
-    pts_A = np.array(correspondences_A, dtype=np.float32)
-    means_B = np.array(correspondences_B_mu, dtype=np.float32)
-    peaks_B = np.array(correspondences_B_peak, dtype=np.float32)
-    covs_B = np.array(correspondences_B_cov, dtype=np.float32)
+    # Assemble correspondences from Gaussian dict
+    pts_A, means_B, peaks_B, covs_B = assemble_correspondences(
+        dict_of_gaussians,
+        log_missing_gaussians=log_missing_gaussians,
+        missing_gaussians_logger=missing_gaussians_logger,
+    )
 
     return pts_A, means_B, peaks_B, covs_B
