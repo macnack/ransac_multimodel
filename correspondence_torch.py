@@ -53,6 +53,220 @@ def _cv2_gaussian_kernel_5x5(sigma: float, device, dtype) -> torch.Tensor:
     return kernel_2d
 
 
+def _softmax_reshape_heatmaps(
+    logits: torch.Tensor,
+    out_patch_size: int,
+    in_h: int,
+    in_w: int,
+) -> torch.Tensor:
+    """Apply softmax and reshape logits to heatmaps (single-frame path).
+    
+    Args:
+        logits: (M, in_h, in_w) tensor
+        out_patch_size: size of the output patch grid (O = sqrt(M))
+        in_h, in_w: spatial dimensions
+    
+    Returns:
+        heatmaps: (n_patches, O, O) tensor
+    """
+    soft = torch.softmax(logits, dim=0)  # (M, in_h, in_w)
+    soft = soft.permute(1, 2, 0).contiguous()  # (in_h, in_w, M)
+    n_patches = in_h * in_w
+    heatmaps = soft.view(n_patches, out_patch_size, out_patch_size)
+    return heatmaps
+
+
+def _compute_global_peaks(
+    heatmaps: torch.Tensor,
+    out_patch_size: int,
+    work_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Compute global peak per patch (pre-blur).
+    
+    Args:
+        heatmaps: (n_patches, O, O)
+        out_patch_size: O
+        work_dtype: torch dtype
+    
+    Returns:
+        global_peaks_xy: (n_patches, 2) with [x, y] coords
+    """
+    flat = heatmaps.reshape(heatmaps.shape[0], -1)
+    global_peak_idx = torch.argmax(flat, dim=1)
+    global_peak_y = (global_peak_idx // out_patch_size).to(work_dtype)
+    global_peak_x = (global_peak_idx % out_patch_size).to(work_dtype)
+    global_peaks_xy = torch.stack([global_peak_x, global_peak_y], dim=1)
+    return global_peaks_xy
+
+
+def _apply_blur_and_detect_peaks(
+    heatmaps: torch.Tensor,
+    fixed_threshold: float,
+    fixed_window_size: int,
+    target_device,
+    work_dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply Gaussian blur and max-pool to detect local maxima.
+    
+    Args:
+        heatmaps: (n_patches, O, O)
+        fixed_threshold: threshold for peak detection
+        fixed_window_size: window size for dilation
+        target_device: torch device
+        work_dtype: torch dtype
+    
+    Returns:
+        (blurred, peaks_mask) tensors
+    """
+    blur_kernel = _cv2_gaussian_kernel_5x5(
+        sigma=1.1, device=target_device, dtype=work_dtype
+    )
+    blur_kernel = blur_kernel.view(1, 1, 5, 5)
+    heatmaps_padded = F.pad(heatmaps.unsqueeze(1), (2, 2, 2, 2), mode="replicate")
+    blurred = F.conv2d(heatmaps_padded, blur_kernel, padding=0)
+    
+    W = int(fixed_window_size)
+    pad_max = W // 2
+    pooled = F.max_pool2d(blurred, kernel_size=W, stride=1, padding=pad_max)
+    
+    if pooled.shape[-1] != blurred.shape[-1]:
+        pooled = pooled[..., :blurred.shape[-2], :blurred.shape[-1]]
+    
+    peaks_mask = (blurred > fixed_threshold) & (blurred == pooled)
+    peaks_mask = peaks_mask.squeeze(1)
+    
+    return blurred, peaks_mask
+
+
+def _gather_and_compute_moments(
+    blurred: torch.Tensor,
+    peaks_mask: torch.Tensor,
+    fixed_window_size: int,
+    out_patch_size: int,
+    target_device,
+    work_dtype,
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor, torch.Tensor,
+]:
+    """Gather windows at peak locations and compute image moments.
+    
+    Returns:
+        (patch_idx, py_peak, px_peak,
+         local_mean_x, local_mean_y,
+         cov_xx, cov_yy, cov_xy,
+         x_min_clamped_global, y_min_clamped_global)
+    """
+    W = int(fixed_window_size)
+    half_w = W // 2
+    full_window = 2 * half_w + 1
+    
+    blurred_padded = F.pad(blurred, (half_w, half_w, half_w, half_w))
+    
+    coords = torch.arange(out_patch_size, device=target_device, dtype=work_dtype)
+    grid_y, grid_x = torch.meshgrid(coords, coords, indexing="ij")
+    x_min_clamped = (grid_x - half_w).clamp(min=0)
+    y_min_clamped = (grid_y - half_w).clamp(min=0)
+    
+    # Locate peaks
+    patch_idx, py_peak, px_peak = peaks_mask.nonzero(as_tuple=True)
+    
+    # Gather windows
+    dy = torch.arange(full_window, device=target_device)
+    dx = torch.arange(full_window, device=target_device)
+    dy_grid, dx_grid = torch.meshgrid(dy, dx, indexing="ij")
+    
+    py_idx = py_peak[:, None, None] + dy_grid[None]
+    px_idx = px_peak[:, None, None] + dx_grid[None]
+    windows = blurred_padded[patch_idx[:, None, None], 0, py_idx, px_idx]
+    
+    # Compute moments
+    coord = torch.arange(full_window, device=target_device, dtype=work_dtype)
+    yy, xx = torch.meshgrid(coord, coord, indexing="ij")
+    
+    m00 = windows.sum(dim=(-1, -2))
+    m10 = (windows * xx).sum(dim=(-1, -2))
+    m01 = (windows * yy).sum(dim=(-1, -2))
+    m11 = (windows * xx * yy).sum(dim=(-1, -2))
+    m20 = (windows * xx * xx).sum(dim=(-1, -2))
+    m02 = (windows * yy * yy).sum(dim=(-1, -2))
+    
+    # Filter out degenerate windows
+    keep = m00 > 0
+    if not bool(keep.all()):
+        patch_idx = patch_idx[keep]
+        py_peak = py_peak[keep]
+        px_peak = px_peak[keep]
+        m00 = m00[keep]; m10 = m10[keep]; m01 = m01[keep]
+        m11 = m11[keep]; m20 = m20[keep]; m02 = m02[keep]
+    
+    # Compute mean and covariance
+    local_mean_x = m10 / m00
+    local_mean_y = m01 / m00
+    cov_xx = m20 / m00 - local_mean_x * local_mean_x
+    cov_yy = m02 / m00 - local_mean_y * local_mean_y
+    cov_xy = m11 / m00 - local_mean_x * local_mean_y
+    
+    return (
+        patch_idx, py_peak, px_peak,
+        local_mean_x, local_mean_y,
+        cov_xx, cov_yy, cov_xy,
+        x_min_clamped, y_min_clamped,
+    )
+
+
+def _assemble_torch_correspondences(
+    patch_idx: torch.Tensor,
+    py_peak: torch.Tensor,
+    px_peak: torch.Tensor,
+    local_mean_x: torch.Tensor,
+    local_mean_y: torch.Tensor,
+    cov_xx: torch.Tensor,
+    cov_yy: torch.Tensor,
+    cov_xy: torch.Tensor,
+    x_min_clamped: torch.Tensor,
+    y_min_clamped: torch.Tensor,
+    global_peaks_xy: torch.Tensor,
+    in_h: int,
+    in_w: int,
+    work_dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Assemble final correspondence arrays from computed values.
+    
+    Returns:
+        (pts_A, means_B, peaks_B, covs_B) as torch tensors
+    """
+    # Add window offset to local moments
+    sel_mean_x = x_min_clamped[py_peak, px_peak] + local_mean_x
+    sel_mean_y = y_min_clamped[py_peak, px_peak] + local_mean_y
+    sel_cov_xx = cov_xx + 1e-4
+    sel_cov_yy = cov_yy + 1e-4
+    sel_cov_xy = cov_xy
+    
+    # Map patch index to image-A (px, py) coordinates
+    patch_py = (patch_idx // in_w).to(work_dtype)
+    patch_px = (patch_idx % in_w).to(work_dtype)
+    pts_A = torch.stack([patch_px, patch_py], dim=1)
+    
+    means_B = torch.stack([sel_mean_x, sel_mean_y], dim=1)
+    peaks_B = global_peaks_xy[patch_idx]
+    
+    covs_B = torch.stack(
+        [
+            torch.stack([sel_cov_xx, sel_cov_xy], dim=1),
+            torch.stack([sel_cov_xy, sel_cov_yy], dim=1),
+        ],
+        dim=1,
+    )
+    
+    return pts_A, means_B, peaks_B, covs_B
+
+    g = g / g.sum()
+    kernel_2d = g[:, None] * g[None, :]
+    return kernel_2d
+
+
 def _moment_kernels(window_size: int, device, dtype) -> torch.Tensor:
     """Build the six raw-moment convolution kernels.
 
@@ -139,104 +353,25 @@ def find_gaussians_torch(
         "Tensor's first dimension must be a perfect square."
     )
     in_h, in_w = int(tensor.shape[1]), int(tensor.shape[2])
-    n_patches = in_h * in_w
 
     target_device = torch.device(device)
     work_dtype = torch.float32
 
     logits = tensor.to(device=target_device, dtype=work_dtype, non_blocking=True)
 
-    # ------------------------------------------------------------------ #
-    # 1. Softmax over image-B patches, per (py, px) of image A.          #
-    # ------------------------------------------------------------------ #
-    # Mirror the numpy code:
-    #     heatmap = torch.softmax(tensor[:, py, px].float(), dim=0)
-    #     heatmap = heatmap.reshape(out_patch_size, out_patch_size)
-    # which is a softmax along the M axis followed by a row-major reshape.
-    soft = torch.softmax(logits, dim=0)  # (M, in_h, in_w)
-    # Re-arrange to (n_patches, 1, O, O) for batched conv2d / pooling.
-    # For each (py, px), the heatmap is `soft[:, py, px].reshape(O, O)`.
-    soft = soft.permute(1, 2, 0).contiguous()           # (in_h, in_w, M)
-    heatmaps = soft.view(n_patches, out_patch_size, out_patch_size)
+    # Step 1: Softmax and reshape to heatmaps
+    heatmaps = _softmax_reshape_heatmaps(logits, out_patch_size, in_h, in_w)
 
-    # ------------------------------------------------------------------ #
-    # Global peak per patch (computed *before* the blur, matching cv2). #
-    # ------------------------------------------------------------------ #
-    flat = heatmaps.reshape(n_patches, -1)
-    global_peak_idx = torch.argmax(flat, dim=1)             # (n_patches,)
-    global_peak_y = (global_peak_idx // out_patch_size).to(work_dtype)
-    global_peak_x = (global_peak_idx %  out_patch_size).to(work_dtype)
-    # Stored as (x, y) per the numpy convention.
-    global_peaks_xy = torch.stack([global_peak_x, global_peak_y], dim=1)  # (n_patches, 2)
+    # Step 2: Compute global peak per patch (pre-blur)
+    global_peaks_xy = _compute_global_peaks(heatmaps, out_patch_size, work_dtype)
 
-    # ------------------------------------------------------------------ #
-    # 2. cv2-equivalent 5x5 Gaussian blur, applied to every patch.       #
-    # ------------------------------------------------------------------ #
-    blur_kernel = _cv2_gaussian_kernel_5x5(
-        sigma=1.1, device=target_device, dtype=work_dtype
+    # Step 3: Apply blur and detect local maxima
+    blurred, peaks_mask = _apply_blur_and_detect_peaks(
+        heatmaps, fixed_threshold, fixed_window_size, target_device, work_dtype
     )
-    blur_kernel = blur_kernel.view(1, 1, 5, 5)
-    # cv2.GaussianBlur defaults to BORDER_REFLECT_101 — match it via F.pad
-    # with mode='replicate' (the closest mode F.pad supports; differences are
-    # sub-pixel at the boundary). Using zero-pad here drops boundary peaks
-    # that the cv2 reference accepts (observed on sample 122).
-    heatmaps_padded = F.pad(heatmaps.unsqueeze(1), (2, 2, 2, 2), mode="replicate")
-    blurred = F.conv2d(heatmaps_padded, blur_kernel, padding=0)  # (n_patches, 1, O, O)
 
-    # ------------------------------------------------------------------ #
-    # 3. Local maxima via max_pool2d (the dilate equivalent).            #
-    # ------------------------------------------------------------------ #
-    # cv2.dilate with a (W, W) structuring element of ones is exactly a
-    # max filter with kernel W and centred output, which is what max_pool2d
-    # with stride=1 and padding=W//2 gives us.
-    W = int(fixed_window_size)
-    pad_max = W // 2
-    pooled = F.max_pool2d(blurred, kernel_size=W, stride=1, padding=pad_max)
-
-    # cv2's dilate centres the structuring element on its anchor (default
-    # anchor=(-1, -1) -> kernel centre).  For odd W the max_pool2d output
-    # already has the same shape; for even W (e.g. the default 4) the pool
-    # output is 1 pixel larger on each spatial dim, so we crop.
-    if pooled.shape[-1] != blurred.shape[-1]:
-        # Even-kernel case: drop the trailing row/col so the anchor is at the
-        # top-left of the 2x2 window centre, matching cv2's even-kernel
-        # convention closely enough for peak detection.
-        pooled = pooled[..., :blurred.shape[-2], :blurred.shape[-1]]
-
-    peaks_mask = (blurred > fixed_threshold) & (blurred == pooled)  # (n_patches, 1, O, O)
-    peaks_mask = peaks_mask.squeeze(1)                              # (n_patches, O, O)
-
-    # ------------------------------------------------------------------ #
-    # 4. Locate peaks first, then compute moments only at those windows. #
-    # ------------------------------------------------------------------ #
-    # The previous implementation conv'd the whole heatmap with 6 moment
-    # kernels — O(n_patches * O^2 * window^2 * 6) compute. Most of that work
-    # is thrown away because only a handful of pixels per patch are peaks.
-    # Gather the windows once at the peak indices and compute moments per
-    # window — O(n_peaks * window^2 * 6), typically 100x less.
-    half_w = W // 2
-    full_window = 2 * half_w + 1
-    blurred_2d = blurred.squeeze(1)  # (n_patches, O, O)
-
-    # Pad-and-unfold so each pixel's full_window x full_window neighborhood
-    # is accessible by indexing. Zero-pad matches the numpy reference's
-    # clipped-window semantics (zero pixels outside the image contribute 0).
-    blurred_padded = F.pad(blurred.unsqueeze(0).squeeze(0), (half_w, half_w, half_w, half_w))
-    # blurred is (n_patches, 1, O, O); after pad it's (n_patches, 1, O+2h, O+2h).
-
-    # Pre-compute per-pixel window top-left offsets (clamped to [0, O)) for
-    # later mean = local_mean + clamped_offset.
-    coords = torch.arange(out_patch_size, device=target_device, dtype=work_dtype)
-    grid_y, grid_x = torch.meshgrid(coords, coords, indexing="ij")  # (O, O)
-    x_min_clamped = (grid_x - half_w).clamp(min=0)  # (O, O)
-    y_min_clamped = (grid_y - half_w).clamp(min=0)
-
-    # ------------------------------------------------------------------ #
-    # 5. Mask peaks and gather per-peak windows.                          #
-    # ------------------------------------------------------------------ #
-    valid_mask_pre = peaks_mask                                # (n_patches, O, O)
-
-    if not bool(valid_mask_pre.any()):
+    # Check if no peaks were found
+    if not bool(peaks_mask.any()):
         empty = np.zeros((0, 2), dtype=np.float32)
         empty_cov = np.zeros((0, 2, 2), dtype=np.float32)
         if log_missing_gaussians:
@@ -249,94 +384,35 @@ def find_gaussians_torch(
                     missing_gaussians_logger(px, py)
         return empty, empty, empty, empty_cov
 
-    patch_idx, py_peak, px_peak = valid_mask_pre.nonzero(as_tuple=True)
-    # patch_idx, py_peak, px_peak each have shape (n_peaks_total,).
+    # Step 4: Gather windows and compute moments
+    (
+        patch_idx, py_peak, px_peak,
+        local_mean_x, local_mean_y,
+        cov_xx, cov_yy, cov_xy,
+        x_min_clamped, y_min_clamped,
+    ) = _gather_and_compute_moments(
+        blurred, peaks_mask, fixed_window_size, out_patch_size,
+        target_device, work_dtype
+    )
 
-    # Gather (n_peaks, full_window, full_window) windows around each peak.
-    # blurred_padded shape: (n_patches, 1, O+2h, O+2h). At padded coords
-    # (py + h_w + dy, px + h_w + dx) for dy/dx in [-h_w, h_w] — but since we
-    # padded by h_w, that's just (py + dy + h_w, px + dx + h_w). Use a single
-    # advanced index: build offset grids once and gather.
-    dy = torch.arange(full_window, device=target_device)  # 0..full_window-1
-    dx = torch.arange(full_window, device=target_device)
-    dy_grid, dx_grid = torch.meshgrid(dy, dx, indexing="ij")  # (W, W) each
-
-    # Indices into blurred_padded along H and W axes for every peak's window.
-    # Shape: (n_peaks, W, W)
-    py_idx = py_peak[:, None, None] + dy_grid[None]
-    px_idx = px_peak[:, None, None] + dx_grid[None]
-    # Channel index is 0 (we squeezed earlier; re-add the 1-dim for indexing)
-    windows = blurred_padded[patch_idx[:, None, None], 0, py_idx, px_idx]
-    # windows: (n_peaks, full_window, full_window)
-
-    # Compute moments per window (n_peaks small set of W*W ops).
-    coord = torch.arange(full_window, device=target_device, dtype=work_dtype)
-    yy, xx = torch.meshgrid(coord, coord, indexing="ij")  # (W, W)
-
-    m00 = windows.sum(dim=(-1, -2))
-    m10 = (windows * xx).sum(dim=(-1, -2))
-    m01 = (windows * yy).sum(dim=(-1, -2))
-    m11 = (windows * xx * yy).sum(dim=(-1, -2))
-    m20 = (windows * xx * xx).sum(dim=(-1, -2))
-    m02 = (windows * yy * yy).sum(dim=(-1, -2))
-
-    # Drop peaks with degenerate windows (m00 <= 0).
-    keep = m00 > 0
-    if not bool(keep.any()):
+    if patch_idx.numel() == 0:
         empty = np.zeros((0, 2), dtype=np.float32)
         empty_cov = np.zeros((0, 2, 2), dtype=np.float32)
         return empty, empty, empty, empty_cov
 
-    if not bool(keep.all()):
-        patch_idx = patch_idx[keep]
-        py_peak = py_peak[keep]
-        px_peak = px_peak[keep]
-        m00 = m00[keep]; m10 = m10[keep]; m01 = m01[keep]
-        m11 = m11[keep]; m20 = m20[keep]; m02 = m02[keep]
+    # Step 5: Assemble correspondence arrays
+    pts_A, means_B, peaks_B, covs_B = _assemble_torch_correspondences(
+        patch_idx, py_peak, px_peak,
+        local_mean_x, local_mean_y,
+        cov_xx, cov_yy, cov_xy,
+        x_min_clamped, y_min_clamped,
+        global_peaks_xy,
+        in_h, in_w, work_dtype
+    )
 
-    local_mean_x = m10 / m00
-    local_mean_y = m01 / m00
-    cov_xx = m20 / m00 - local_mean_x * local_mean_x
-    cov_yy = m02 / m00 - local_mean_y * local_mean_y
-    cov_xy = m11 / m00 - local_mean_x * local_mean_y
-
-    # Add window top-left offset (clamped to image, matching numpy clip).
-    sel_mean_x = x_min_clamped[py_peak, px_peak] + local_mean_x
-    sel_mean_y = y_min_clamped[py_peak, px_peak] + local_mean_y
-    sel_cov_xx = cov_xx + 1e-4
-    sel_cov_yy = cov_yy + 1e-4
-    sel_cov_xy = cov_xy
-
-    # For the missing-patch logging path further down.
-    valid_mask = valid_mask_pre.clone()
-    # Mark the dropped (m00<=0) peaks as invalid in the mask too.
-    if not bool(keep.all()):
-        flat_idx = (patch_idx * out_patch_size + py_peak) * out_patch_size + px_peak
-        # We don't actually need to update valid_mask elementwise here —
-        # the per-patch any() at the end is what matters.
-        pass
-
-    # Map flat patch index back to (px_A, py_A) in image-A grid.
-    patch_py = (patch_idx // in_w).to(work_dtype)
-    patch_px = (patch_idx %  in_w).to(work_dtype)
-    pts_A = torch.stack([patch_px, patch_py], dim=1)               # (N, 2)
-
-    means_B = torch.stack([sel_mean_x, sel_mean_y], dim=1)         # (N, 2)
-
-    # Per-Gaussian global peak: replicate the patch's global peak.
-    peaks_B = global_peaks_xy[patch_idx]                           # (N, 2)
-
-    covs_B = torch.stack(
-        [
-            torch.stack([sel_cov_xx, sel_cov_xy], dim=1),
-            torch.stack([sel_cov_xy, sel_cov_yy], dim=1),
-        ],
-        dim=1,
-    )                                                              # (N, 2, 2)
-
-    # Optional missing-patch logging -- replicates numpy print behaviour.
+    # Optional missing-patch logging
     if log_missing_gaussians or missing_gaussians_logger is not None:
-        any_peak_per_patch = valid_mask.view(n_patches, -1).any(dim=1).cpu().numpy()
+        any_peak_per_patch = peaks_mask.view(-1, out_patch_size * out_patch_size).any(dim=1).cpu().numpy()
         if not any_peak_per_patch.all():
             for flat_i, has in enumerate(any_peak_per_patch):
                 if has:
@@ -348,12 +424,14 @@ def find_gaussians_torch(
                 if missing_gaussians_logger is not None:
                     missing_gaussians_logger(px, py)
 
+    # Convert to numpy
     pts_A_np = pts_A.detach().cpu().numpy().astype(np.float32, copy=False)
     means_B_np = means_B.detach().cpu().numpy().astype(np.float32, copy=False)
     peaks_B_np = peaks_B.detach().cpu().numpy().astype(np.float32, copy=False)
     covs_B_np = covs_B.detach().cpu().numpy().astype(np.float32, copy=False)
 
     return pts_A_np, means_B_np, peaks_B_np, covs_B_np
+
 
 
 # --------------------------------------------------------------------------- #
