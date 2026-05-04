@@ -1,20 +1,21 @@
-import cv2
 import numpy as np
 import torch
 
 from .parity_utils import np_to_torch, torch_to_np
+from .geometry_utils import project_points_torch, srt_to_matrix_torch
+from .residuals import (
+    mahalanobis_residuals_torch,
+    huber_loss_torch,
+    regularization_loss_torch,
+)
+from .ransac_init import ransac_init
 
-
-def project_points_torch(H: torch.Tensor, pts: torch.Tensor) -> torch.Tensor:
-    """
-    Torch equivalent of project_points using homogeneous coordinates.
-    """
-    ones = torch.ones((pts.shape[0], 1), dtype=pts.dtype, device=pts.device)
-    pts_homo = torch.cat([pts, ones], dim=1)
-    proj = (H @ pts_homo.T).T
-    z = proj[:, 2:] + 1e-6
-    proj_2d = proj[:, :2] / z
-    return proj_2d
+__all__ = [
+    "project_points_torch",
+    "homography_residuals_vectorized_torch",
+    "srt_residuals_torch",
+    "optimize_homography_torch",
+]
 
 
 def homography_residuals_vectorized_torch(
@@ -29,33 +30,7 @@ def homography_residuals_vectorized_torch(
     H = torch.cat([h_elements, h_elements.new_tensor([1.0])]).view(3, 3)
     pts_B_proj = project_points_torch(H, pts_A)
     err = pts_B_proj - means_B
-    mahalanobis_sq = torch.einsum("ni,nij,nj->n", err, inv_covs_B, err)
-    return torch.sqrt(torch.clamp(mahalanobis_sq, min=0.0))
-
-
-def srt_to_matrix_torch(params: torch.Tensor) -> torch.Tensor:
-    """
-    Build 3x3 similarity matrix from [s, theta, tx, ty].
-    """
-    s, theta, tx, ty = params[0], params[1], params[2], params[3]
-
-    s = torch.clamp(s, 0.0, 4.0)
-    theta = torch.clamp(theta, float(np.radians(-90.0)), float(np.radians(90.0)))
-
-    c, si = torch.cos(theta), torch.sin(theta)
-    return torch.stack(
-        [
-            torch.stack([s * c, -s * si, tx]),
-            torch.stack([s * si, s * c, ty]),
-            torch.stack(
-                [
-                    params.new_tensor(0.0),
-                    params.new_tensor(0.0),
-                    params.new_tensor(1.0),
-                ]
-            ),
-        ]
-    )
+    return mahalanobis_residuals_torch(err, inv_covs_B)
 
 
 def srt_residuals_torch(
@@ -71,21 +46,10 @@ def srt_residuals_torch(
     pts_B_proj = project_points_torch(H, pts_A)
     err = pts_B_proj - means_B
 
-    mahalanobis_sq = torch.einsum("ni,nij,nj->n", err, inv_covs_B, err)
-    mahalanobis_loss = torch.sqrt(torch.clamp(mahalanobis_sq, min=0.0))
-
-    scale_loss = (params[0] - 1.0) ** 2
-    rot_loss = torch.rad2deg(params[1]) ** 2
-    regularization = scale_loss * 0.01 + rot_loss * 0.001
+    mahalanobis_loss = mahalanobis_residuals_torch(err, inv_covs_B)
+    regularization = regularization_loss_torch(params, model="sRT")
 
     return mahalanobis_loss + regularization
-
-
-def _huber_cost(residuals: torch.Tensor, f_scale: float = 2.0) -> torch.Tensor:
-    abs_r = torch.abs(residuals)
-    quad = 0.5 * residuals**2
-    lin = f_scale * (abs_r - 0.5 * f_scale)
-    return torch.where(abs_r <= f_scale, quad, lin).mean()
 
 
 def optimize_homography_torch(
@@ -125,13 +89,11 @@ def optimize_homography_torch(
     else:
         ransac_pts_B = peaks_B if peaks_B is not None else means_B
 
-    H_init, _ = cv2.findHomography(pts_A, ransac_pts_B, cv2.RANSAC, maxIters=5000)
-    if H_init is None:
-        if not quiet:
-            print("Warning: RANSAC failed to find an initial guess. Defaulting to Identity.")
-        H_init = np.eye(3)
-
-    H_init_norm = H_init / H_init[2, 2]
+    H_init, H_init_norm = ransac_init(
+        pts_A,
+        ransac_pts_B,
+        quiet=quiet,
+    )
 
     pts_A_t = np_to_torch(pts_A, device=device, dtype=dtype)
     means_B_t = np_to_torch(means_B, device=device, dtype=dtype)
@@ -170,7 +132,7 @@ def optimize_homography_torch(
     def closure():
         optimizer.zero_grad(set_to_none=True)
         residuals = residual_fn()
-        loss = _huber_cost(residuals, f_scale=f_scale)
+        loss = huber_loss_torch(residuals, f_scale=f_scale).mean()
         loss.backward()
         return loss
 
