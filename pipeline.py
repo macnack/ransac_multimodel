@@ -265,7 +265,7 @@ def _ransac_init_one(
             ransacReprojThreshold=reproj, maxIters=max_iters, confidence=confidence,
         )
         if H is None:
-            return np.eye(3, dtype=np.float64)
+            return None
         return H / H[2, 2]
 
     # Torch-native paths. Build (1, N, 2) tensors on the requested device
@@ -292,6 +292,65 @@ def _ransac_init_one(
 
     H = H_t.cpu().numpy()
     return H / H[2, 2]
+
+
+def _ransac_init_weighted(
+    pts_A: np.ndarray,
+    pts_B: np.ndarray,
+    weights: np.ndarray,
+    gamma: float,
+    reproj: float,
+    n_iter: int,
+    seed: int,
+) -> Optional[np.ndarray]:
+    """Custom RANSAC with weighted 4-point sampling: P(i) ∝ weights[i]^gamma.
+
+    Used for "p_mode" / "p_mode_power" sampling modes for fair comparison
+    against uniform RANSAC. cv2.findHomography(method=0) is DLT — used for
+    the per-sample fit because USAC_MAGSAC ignores caller-supplied indices.
+
+    Returns normalized 3x3 H (refit on inliers), or None on degenerate input.
+    """
+    n = pts_A.shape[0]
+    if n < 4:
+        return None
+    rng = np.random.default_rng(seed)
+    w = np.asarray(weights, dtype=np.float64) ** float(gamma)
+    if w.sum() <= 0 or not np.isfinite(w.sum()):
+        p = np.full(n, 1.0 / n)
+    else:
+        p = w / w.sum()
+    pts_A_h = np.hstack([pts_A.astype(np.float32), np.ones((n, 1), dtype=np.float32)])
+
+    best_inliers = -1
+    best_H = None
+    for _ in range(n_iter):
+        idx = rng.choice(n, size=4, replace=False, p=p)
+        H, _ = cv2.findHomography(pts_A[idx], pts_B[idx], method=0)
+        if H is None:
+            continue
+        proj = (H @ pts_A_h.T).T
+        z = proj[:, 2:3]
+        z = np.where(np.abs(z) < 1e-12, 1e-12, z)
+        proj2d = proj[:, :2] / z
+        d = np.linalg.norm(proj2d - pts_B, axis=1)
+        n_inliers = int((d < reproj).sum())
+        if n_inliers > best_inliers:
+            best_inliers = n_inliers
+            best_H = H
+    if best_H is None:
+        return None
+    # Refit on inliers if 4+.
+    proj = (best_H @ pts_A_h.T).T
+    z = proj[:, 2:3]
+    z = np.where(np.abs(z) < 1e-12, 1e-12, z)
+    d = np.linalg.norm(proj[:, :2] / z - pts_B, axis=1)
+    inlier_mask = d < reproj
+    if int(inlier_mask.sum()) >= 4:
+        H_refit, _ = cv2.findHomography(pts_A[inlier_mask], pts_B[inlier_mask], method=0)
+        if H_refit is not None:
+            best_H = H_refit
+    return best_H / best_H[2, 2]
 
 
 # --------------------------------------------------------------------------- #
@@ -400,6 +459,8 @@ def estimate_homography(
                 ransac_max_iters, ransac_confidence,
                 init_backend=init_backend,
             )
+            if H_init is None:
+                H_init = np.eye(3, dtype=np.float64)
             H = H_init
 
     elif backend in ("torch_cpu", "torch_cuda"):
@@ -425,6 +486,8 @@ def estimate_homography(
             ransac_max_iters, ransac_confidence,
             init_backend=init_backend, device=device,
         )
+        if H_init is None:
+            H_init = np.eye(3, dtype=np.float64)
         if not refine:
             H = H_init
         else:
@@ -565,6 +628,10 @@ def estimate_homography_batched(
     return_per_frame: bool = False,
     return_result: bool = False,
     divergence_guard: Optional[DivergenceGuardConfig] = None,
+    ransac_sampling: str = "uniform",
+    ransac_sampling_gamma: float = 1.0,
+    ransac_sampling_iters: int = 2000,
+    ransac_sampling_seed: int = 0,
 ):
     """Batched end-to-end refinement for ``(B, M, in_h, in_w)`` logits.
 
@@ -708,6 +775,14 @@ def estimate_homography_batched(
 
     starts = np.concatenate([[0], np.cumsum(counts_cpu)[:-1]]).astype(np.int64)
 
+    if ransac_sampling not in ("uniform", "p_mode", "p_mode_power"):
+        raise ValueError(
+            f"ransac_sampling must be one of 'uniform', 'p_mode', 'p_mode_power'; "
+            f"got {ransac_sampling!r}."
+        )
+
+    failed_frames: List[int] = []  # populated by cv2 path; empty for GPU init paths
+
     # Cached host copies — populated lazily by the cv2 init path or by the
     # return_per_frame block below. None until first transfer.
     pts_A_cpu: Optional[np.ndarray] = None
@@ -723,22 +798,48 @@ def estimate_homography_batched(
             gpu_out.means_B.detach().cpu().numpy().astype(np.float32, copy=False)
             if use_means_for_ransac else None
         )
+        if ransac_sampling != "uniform":
+            pv = getattr(gpu_out, "peak_values", None)
+            peak_values_cpu = (
+                pv.detach().cpu().numpy().astype(np.float32, copy=False)
+                if pv is not None
+                else np.ones(pts_A_cpu.shape[0], dtype=np.float32)
+            )
+        else:
+            peak_values_cpu = None
+
         H_inits: List[np.ndarray] = []
         for b in range(B):
             s = int(starts[b])
             n = int(counts_cpu[b])
             if n < 4:
                 H_inits.append(np.eye(3, dtype=np.float64))
+                failed_frames.append(b)
             else:
                 pts = pts_A_cpu[s:s + n]
                 peaks = peaks_B_cpu[s:s + n]
                 mu = means_B_cpu[s:s + n] if use_means_for_ransac else None
-                H_inits.append(_ransac_init_one(
-                    pts, peaks, mu, use_means_for_ransac,
-                    ransac_method, ransac_reproj_threshold,
-                    ransac_max_iters, ransac_confidence,
-                    init_backend="cv2",
-                ))
+                if ransac_sampling == "uniform":
+                    H_init_b = _ransac_init_one(
+                        pts, peaks, mu, use_means_for_ransac,
+                        ransac_method, ransac_reproj_threshold,
+                        ransac_max_iters, ransac_confidence,
+                        init_backend="cv2",
+                    )
+                else:
+                    target = mu if use_means_for_ransac else peaks
+                    H_init_b = _ransac_init_weighted(
+                        pts, target, peak_values_cpu[s:s + n],
+                        gamma=ransac_sampling_gamma,
+                        reproj=ransac_reproj_threshold,
+                        n_iter=ransac_sampling_iters,
+                        seed=ransac_sampling_seed + b,
+                    )
+                if H_init_b is None:
+                    H_inits.append(np.eye(3, dtype=np.float64))
+                    failed_frames.append(b)
+                else:
+                    H_inits.append(H_init_b)
     else:
         # GPU-resident batched init: stay on device, use the chosen torch
         # backend in ONE batched call. Skips the GPU→CPU per-frame round
@@ -786,6 +887,13 @@ def estimate_homography_batched(
         else:
             H_t = lm_out
         H_np = H_t.detach().cpu().numpy()
+
+        # Overwrite failed frames with NaN so downstream aggregation treats them
+        # as failures rather than successes (eye(3) was only a placeholder for LM).
+        if failed_frames:
+            nan_mat = np.full((3, 3), np.nan, dtype=H_np.dtype)
+            for b in failed_frames:
+                H_np[b] = nan_mat
 
         # Apply divergence guard if configured
         if divergence_guard is not None and history is not None:
