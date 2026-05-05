@@ -265,7 +265,7 @@ def _ransac_init_one(
             ransacReprojThreshold=reproj, maxIters=max_iters, confidence=confidence,
         )
         if H is None:
-            return None
+            return np.eye(3, dtype=np.float64)
         return H / H[2, 2]
 
     # Torch-native paths. Build (1, N, 2) tensors on the requested device
