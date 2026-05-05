@@ -459,6 +459,9 @@ class GaussiansBatchTensors:
     batch_idx: torch.Tensor   # (N_total,)    int64 — frame index for each peak
     counts: torch.Tensor      # (B,)          int64 — how many peaks per frame
     B: int                    # batch size (for downstream sanity checks)
+    # softmax mass at the post-blur peak cell — usable as per-mode confidence
+    # weight in RANSAC sampling. Legacy callers ignore it.
+    peak_values: torch.Tensor = None  # (N_total,)  float32  ∈ [0, 1]
 
 
 def find_gaussians_torch_batch(
@@ -567,11 +570,12 @@ def find_gaussians_torch_batch(
     def _empty_tensor_result() -> GaussiansBatchTensors:
         z2 = torch.zeros((0, 2), dtype=work_dtype, device=target_device)
         z22 = torch.zeros((0, 2, 2), dtype=work_dtype, device=target_device)
+        z1 = torch.zeros((0,), dtype=work_dtype, device=target_device)
         return GaussiansBatchTensors(
             pts_A=z2, means_B=z2.clone(), peaks_B=z2.clone(), covs_B=z22,
             batch_idx=torch.zeros((0,), dtype=torch.long, device=target_device),
             counts=torch.zeros((B,), dtype=torch.long, device=target_device),
-            B=B,
+            B=B, peak_values=z1,
         )
 
     if not bool(peaks_mask.any()):
@@ -645,6 +649,10 @@ def find_gaussians_torch_batch(
         dim=1,
     )                                                                # (N_total, 2, 2)
 
+    # Per-peak softmax mass at the post-blur peak cell — confidence weight for
+    # weighted RANSAC sampling (pipeline.py ransac_sampling kwarg).
+    peak_values_all = blurred.squeeze(1)[patch_idx, py_peak, px_peak]
+
     if return_tensors:
         # Per-frame counts for downstream padding. bincount needs a contiguous
         # 0..B-1 range; we know batch_idx is sorted (see comment below) so a
@@ -654,6 +662,7 @@ def find_gaussians_torch_batch(
             pts_A=pts_A_all, means_B=means_B_all,
             peaks_B=peaks_B_all, covs_B=covs_B_all,
             batch_idx=batch_idx, counts=counts, B=B,
+            peak_values=peak_values_all,
         )
 
     # One bulk transfer to host, then per-frame slicing in numpy (cheap).
