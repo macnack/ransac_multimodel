@@ -433,10 +433,13 @@ def estimate_homography(
             covs_B_t = torch.from_numpy(covs_B.astype(np.float64)).to(device)
             H_init_t = torch.from_numpy(H_init).to(device)
             with torch.no_grad():
+                _kw = dict(lm_kwargs or {})
+                _f_scale = _kw.pop("f_scale", f_scale)
+                _max_iter = _kw.pop("max_iter", max_iter)
                 H_t = refine_homography_torch_lm_torch(
                     pts_A_t, means_B_t, covs_B_t, H_init_t,
-                    model=model, f_scale=f_scale, max_iter=max_iter,
-                    **(lm_kwargs or {}),
+                    model=model, f_scale=_f_scale, max_iter=_max_iter,
+                    **_kw,
                 )
             H = H_t[0].detach().cpu().numpy()
     else:
@@ -768,12 +771,15 @@ def estimate_homography_batched(
             gpu_out, H_inits, dtype=torch.float64,
         )
         with torch.no_grad():
+            _kw = dict(lm_kwargs or {})
+            _f_scale = _kw.pop("f_scale", f_scale)
+            _max_iter = _kw.pop("max_iter", max_iter)
             lm_out = refine_homography_torch_lm_torch(
                 pts_A_p, means_B_p, covs_B_p, H_init_p,
                 mask=mask, model=model,
-                f_scale=f_scale, max_iter=max_iter,
+                f_scale=_f_scale, max_iter=_max_iter,
                 track_history=effective_track_history, logger=logger,
-                **(lm_kwargs or {}),
+                **_kw,
             )
         if effective_track_history:
             H_t, history = lm_out
