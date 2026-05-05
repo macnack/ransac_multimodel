@@ -34,11 +34,11 @@ from .homography_theseus import (
     _full_h_to_matrix_batch,
     _huber_robust_residual,
     _params_init_from_H,
-    _ransac_init,
     _srt_to_matrix_batch,
     _whitened_mahalanobis_resid,
 )
 from .parity_utils import np_to_torch, torch_to_np
+from .ransac_init import ransac_init
 
 
 @dataclass
@@ -63,6 +63,40 @@ class LMHistory:
     n_iters: int                             # actual iterations run
     converged: torch.Tensor                  # (B,) bool — final per-batch convergence flag
     final_cost: torch.Tensor                 # (B,) — convenience, == cost[-1]
+
+    def to_numpy(self) -> "NumpyLMHistory":
+        """Convert to NumpyLMHistory for use with divergence guard (pure numpy).
+
+        Detaches from autograd and moves to CPU as needed. Zero-copy for tensors
+        already on CPU; ~B*40 bytes for typical batches.
+        """
+        from .divergence_guard import NumpyLMHistory
+
+        return NumpyLMHistory(
+            cost_init=self.cost[0].detach().cpu().numpy().astype(np.float64),
+            cost_final=self.final_cost.detach().cpu().numpy().astype(np.float64),
+            n_iters=self.n_iters,
+            converged=self.converged.detach().cpu().numpy().astype(bool),
+        )
+
+
+def lm_history_to_numpy(history: LMHistory) -> "NumpyLMHistory":
+    """Convert torch LMHistory to numpy NumpyLMHistory for divergence guard.
+
+    Standalone version of LMHistory.to_numpy(); useful when you have the
+    history but not access to call the method directly.
+
+    Parameters
+    ----------
+    history
+        LMHistory from refine_homography_torch_lm_torch.
+
+    Returns
+    -------
+    NumpyLMHistory
+        Pure numpy, ready for apply_divergence_guard.
+    """
+    return history.to_numpy()
 
 
 def _err_fn_factory(
@@ -435,16 +469,19 @@ def optimize_homography_torch_lm(
     if N < 4:
         raise ValueError("At least 4 points are required to compute a homography.")
 
-    H_init_norm, _inlier_mask = _ransac_init(
+    if use_means_for_ransac:
+        ransac_pts_B = means_B
+    else:
+        ransac_pts_B = peaks_B if peaks_B is not None else means_B
+
+    H_init, H_init_norm = ransac_init(
         pts_A,
-        means_B,
-        peaks_B if peaks_B is None else np.asarray(peaks_B),
-        use_means_for_ransac,
-        ransac_method,
-        ransac_reproj_threshold,
-        ransac_max_iters,
-        ransac_confidence,
-        quiet,
+        ransac_pts_B,
+        method=ransac_method,
+        reproj_threshold=ransac_reproj_threshold,
+        max_iters=ransac_max_iters,
+        confidence=ransac_confidence,
+        quiet=quiet,
     )
 
     L_np = _chol_inv_cov(covs_B.astype(np.float64))

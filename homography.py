@@ -1,48 +1,36 @@
-import cv2
 import numpy as np
 from scipy.optimize import least_squares
 
-
-def project_points(H, pts):
-    """
-    Vectorized projection of Nx2 points using a 3x3 Homography Matrix.
-    """
-    pts_homo = np.hstack([pts, np.ones((pts.shape[0], 1), dtype=pts.dtype)])
-    proj = (H @ pts_homo.T).T
-    z = proj[:, 2:] + 1e-6
-    proj_2d = proj[:, :2] / z
-    return proj_2d
+from .geometry_utils import (
+    extract_srt_from_homography,
+    project_points,
+    srt_to_matrix,
+)
+from .ransac_init import ransac_init
+from .residuals import (
+    huber_loss,
+    mahalanobis_residuals,
+    regularization_loss,
+)
 
 
 def homography_residuals_vectorized(h_elements, pts_A, means_B, inv_covs_B):
-    """
-    Fully vectorized Mahalanobis distance calculation using Einstein Summation.
+    """Residuals for full 8-DOF homography model.
+
+    Fully vectorized Mahalanobis distance calculation. Public symbol used by
+    parity tests (``tests/test_torch_parity.py``) and external callers.
     """
     H = np.append(h_elements, 1.0).reshape(3, 3)
     pts_B_proj = project_points(H, pts_A)
     err = pts_B_proj - means_B
-    mahalanobis_sq = np.einsum("ni,nij,nj->n", err, inv_covs_B, err)
-    return np.sqrt(np.maximum(mahalanobis_sq, 0))
+    return mahalanobis_residuals(err, inv_covs_B)
 
 
-def srt_to_matrix(params):
-    """
-    Build a 3x3 similarity (sRT) matrix from [s, theta, tx, ty].
-    """
-    s, theta, tx, ty = params
-    s = np.clip(s, 0.0, 4.0)
-    theta = np.clip(theta, np.radians(-90.0), np.radians(90.0))
-    c, si = np.cos(theta), np.sin(theta)
-    return np.array(
-        [
-            [s * c, -s * si, tx],
-            [s * si, s * c, ty],
-            [0.0, 0.0, 1.0],
-        ]
-    )
+# Backwards-compatible private alias retained for internal references below.
+_homography_residuals_full = homography_residuals_vectorized
 
 
-def srt_residuals(
+def _srt_residuals_full(
     params,
     pts_A,
     means_B,
@@ -50,34 +38,13 @@ def srt_residuals(
     scale_reg_weight=0.01,
     rot_reg_weight=0.001,
 ):
-    """
-    Mahalanobis residuals for a similarity (sRT) homography parametrised as
-    [s, theta, tx, ty].
-    """
+    """Residuals + regularization for sRT 4-DOF model."""
     H = srt_to_matrix(params)
     pts_B_proj = project_points(H, pts_A)
     err = pts_B_proj - means_B
-    mahalanobis_sq = np.einsum("ni,nij,nj->n", err, inv_covs_B, err)
-    mahalanobis_loss = np.sqrt(np.maximum(mahalanobis_sq, 0))
-
-    scale_loss = (params[0] - 1.0) ** 2
-    rot_loss = np.degrees(params[1]) ** 2
-    regularization = scale_loss * scale_reg_weight + rot_loss * rot_reg_weight
+    mahalanobis_loss = mahalanobis_residuals(err, inv_covs_B)
+    regularization = regularization_loss(params, model="sRT", scale_reg_weight=scale_reg_weight, rot_reg_weight=rot_reg_weight)
     return mahalanobis_loss + regularization
-
-
-def extract_srt_from_homography(H):
-    """
-    Extract the best-fit sRT parameters [s, theta, tx, ty] from a general
-    3x3 homography by reading the top-left 2x2 block.
-    """
-    a = H[0, 0]
-    b = H[1, 0]
-    tx = H[0, 2]
-    ty = H[1, 2]
-    s = np.sqrt(a**2 + b**2)
-    theta = np.arctan2(b, a)
-    return np.array([s, theta, tx, ty])
 
 
 def optimize_homography(
@@ -89,7 +56,7 @@ def optimize_homography(
     use_means_for_ransac=False,
     verbose=0,
     quiet=False,
-    ransac_method=cv2.USAC_FAST,
+    ransac_method=None,
     ransac_reproj_threshold=3.0,
     ransac_max_iters=5000,
     ransac_confidence=0.995,
@@ -103,8 +70,14 @@ def optimize_homography(
     return_details=False,
 ):
     """
-    Optimizes the homography using the Mahalanobis distance and Huber Loss.
+    Optimize the homography using Mahalanobis distance and robust loss.
+    
+    Uses RANSAC for initialization, then refines with scipy.optimize.least_squares.
     """
+    if ransac_method is None:
+        import cv2
+        ransac_method = cv2.USAC_FAST
+
     N = pts_A.shape[0]
     if N < 4:
         raise ValueError("At least 4 points are required to compute a homography.")
@@ -117,21 +90,17 @@ def optimize_homography(
     else:
         ransac_pts_B = peaks_B if peaks_B is not None else means_B
 
-    H_init, inlier_mask = cv2.findHomography(
+    H_init, H_init_norm = ransac_init(
         pts_A,
         ransac_pts_B,
-        ransac_method,
-        ransacReprojThreshold=ransac_reproj_threshold,
-        maxIters=ransac_max_iters,
+        method=ransac_method,
+        reproj_threshold=ransac_reproj_threshold,
+        max_iters=ransac_max_iters,
         confidence=ransac_confidence,
+        quiet=quiet,
     )
-    if H_init is None:
-        if not quiet:
-            print("Warning: RANSAC failed to find an initial guess. Defaulting to Identity.")
-        H_init = np.eye(3)
-        inlier_mask = np.zeros((N, 1), dtype=np.uint8)
+    inlier_mask = np.zeros((N, 1), dtype=np.uint8)
 
-    H_init_norm = H_init / H_init[2, 2]
     h_init_elements = H_init_norm.flatten()[:8]
 
     if model == "sRT":
@@ -143,7 +112,7 @@ def optimize_homography(
             )
 
         res = least_squares(
-            fun=srt_residuals,
+            fun=_srt_residuals_full,
             x0=srt_init,
             args=(pts_A, means_B, inv_covs_B, srt_scale_reg_weight, srt_rot_reg_weight),
             method="trf",
@@ -163,7 +132,7 @@ def optimize_homography(
         H_opt = srt_to_matrix(res.x)
     else:
         res = least_squares(
-            fun=homography_residuals_vectorized,
+            fun=_homography_residuals_full,
             x0=h_init_elements,
             args=(pts_A, means_B, inv_covs_B),
             method="trf",
@@ -192,11 +161,11 @@ def optimize_homography(
 
 def compute_corner_error(H_gt, H_pred, w=1024, h=1024):
     """
-    Computes the mean L2 corner error between two homographies
+    Compute mean L2 corner error between two homographies
     given the width and height of the referenced image.
+    
+    Delegates to geometry_utils for the actual computation.
     """
-    corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
-    corners_gt = project_points(H_gt, corners)
-    corners_pred = project_points(H_pred, corners)
-    error = np.linalg.norm(corners_gt - corners_pred, axis=1).mean()
-    return error
+    from .geometry_utils import compute_corner_error as _compute_corner_error
+    return _compute_corner_error(H_gt, H_pred, w, h)
+
